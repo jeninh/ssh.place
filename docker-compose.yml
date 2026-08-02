@@ -1,0 +1,68 @@
+services:
+  sshplace:
+    build: .
+    image: sshplace:latest
+    container_name: sshplace
+    restart: unless-stopped
+
+    ports:
+      # Port 22 on the host is what makes `ssh ssh.place` work with no -p flag.
+      # If the host still runs sshd on 22, move that to another port first or
+      # change this mapping to something like "2222:2222". Do the move and
+      # reconnect on the new port BEFORE bringing this up, or you can lock
+      # yourself out of the box.
+      - "22:2222"
+      # The HTTP side is deliberately not published. Caddy reaches it over the
+      # compose network and is the only thing that should be serving it, so that
+      # nobody can bypass TLS by hitting the port directly.
+
+    volumes:
+      # Holds the host key, the canvas snapshot and the event log. The host key
+      # in particular has to survive restarts, or every client gets a host key
+      # mismatch warning after a redeploy.
+      - canvas-data:/data
+
+    environment:
+      SSHPLACE_DATA: /data
+      SSHPLACE_SSH_ADDR: ":2222"
+      SSHPLACE_HTTP_ADDR: ":8080"
+      SSHPLACE_WEB_URL: "https://ssh.place"
+      SSHPLACE_LOG_LEVEL: info
+
+    # The distroless image has no shell, so health checks go through the binary
+    # itself rather than curl.
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/sshplace", "-healthcheck", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+    # A drawing server needs no privileges of any kind.
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: caddy
+    restart: unless-stopped
+    depends_on:
+      - sshplace
+
+    ports:
+      - "80:80"
+      - "443:443"
+
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # Certificates live here. Without this volume Caddy re-requests them on
+      # every restart and will hit Let's Encrypt's rate limit.
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  canvas-data:
+  caddy-data:
+  caddy-config:

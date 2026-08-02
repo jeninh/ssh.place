@@ -1,0 +1,12 @@
+# Never ship runtime state into the image — it contains the host key.
+data/
+
+sshplace
+*.test
+*.out
+.git/
+.gitignore
+README.md
+Makefile
+docker-compose.yml
+Caddyfile

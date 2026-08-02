@@ -1,0 +1,35 @@
+# TLS for the read-only web view.
+#
+# SSH goes straight to the container on port 22 and never touches Caddy. This
+# only fronts the HTTP side, which needs a real certificate for two reasons: the
+# canvas image in the README is loaded through GitHub's proxy, which refuses
+# plain HTTP, and nobody should have to type http:// by hand in 2026.
+#
+# Certificates come from Let's Encrypt automatically on first boot, which means
+# ssh.place has to already resolve to this machine before you start Caddy. If it
+# does not, the challenge fails and Caddy retries with a backoff.
+{
+	# Where Let's Encrypt sends expiry warnings if a renewal ever starts failing.
+	email jenin@hackclub.com
+}
+
+ssh.place {
+	reverse_proxy sshplace:8080
+
+	encode gzip
+
+	header {
+		# The canvas can legitimately contain the characters "<script>" in mixed
+		# mode, and /canvas.txt serves them as text/plain. The app sets this
+		# itself; setting it here too means it survives any proxy rewriting.
+		X-Content-Type-Options nosniff
+		Referrer-Policy no-referrer
+		# The pages load nothing external: no CDN, no fonts, no analytics.
+		Content-Security-Policy "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'"
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}

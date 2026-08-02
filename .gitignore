@@ -1,0 +1,11 @@
+# Build output
+/sshplace
+
+# Runtime state: host key, canvas snapshot, event log. The host key in
+# particular must never be committed.
+/data/
+
+# Test and profiling output
+*.test
+*.out
+coverage.*
