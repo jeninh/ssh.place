@@ -326,8 +326,9 @@ func TestConcurrentPlace(t *testing.T) {
 
 	watcher := f.session(t, "0.0.0.0", "watcher")
 
-	// Keep the watcher drained in the background so its buffer never fills and
-	// the count stays exact.
+	// Drain the watcher in the background. It may still fall behind: the hub
+	// deliberately drops updates rather than block a broadcaster, so the count
+	// below is a ceiling, not an equality.
 	var (
 		received int
 		recvMu   sync.Mutex
@@ -370,8 +371,23 @@ func TestConcurrentPlace(t *testing.T) {
 	<-done
 	recvMu.Lock()
 	defer recvMu.Unlock()
-	if received != sessions*rounds {
-		t.Errorf("watcher received %d updates, want %d", received, sessions*rounds)
+
+	total := sessions * rounds
+
+	// The real contract is that nothing is lost silently. A session either gets
+	// every update, or it gets told to resync. Asserting exact delivery instead
+	// makes this test fail on a loaded machine, because falling behind is the
+	// designed behaviour rather than a bug.
+	if received > total {
+		t.Errorf("watcher received %d updates, more than the %d placed", received, total)
+	}
+	if received < total && !watcher.TakeDirty() {
+		t.Errorf("watcher received only %d of %d updates and was not flagged dirty, so the missing ones were lost silently",
+			received, total)
+	}
+	// The undrained placer sessions guarantee the coalescing path ran at all.
+	if f.app.Hub.Dropped() == 0 {
+		t.Error("no updates were coalesced, so this test never exercised that path")
 	}
 }
 
