@@ -252,6 +252,57 @@ You can resize the board between restarts with `-width` and `-height`. If the sa
 snapshot doesn't match any more, whatever still fits gets loaded instead of the
 whole thing being thrown out.
 
+## Automatic deploys
+
+Pushing to `main` redeploys the server, but only after the tests, the
+vulnerability scan and the Docker build have all passed. A push that breaks
+something never reaches the box.
+
+Set it up once. On the server:
+
+```sh
+# 1. The deploy script, from the repo you already cloned
+install -m 755 /root/ssh.place/deploy/redeploy.sh /usr/local/bin/sshplace-deploy
+
+# 2. A key that exists only for deploying, separate from your own
+ssh-keygen -t ed25519 -f /root/.ssh/deploy -N '' -C 'github-actions'
+
+# 3. Let it do exactly one thing and nothing else
+printf 'restrict,command="/usr/local/bin/sshplace-deploy" %s\n' \
+  "$(cat /root/.ssh/deploy.pub)" >> /root/.ssh/authorized_keys
+```
+
+That `restrict,command=` prefix is the part that matters. `command=` means this key
+can only run the redeploy no matter what the client asks for, and `restrict` turns
+off port forwarding, agent forwarding and pty allocation. If the key ever leaks,
+what an attacker gets is the ability to redeploy your own code from your own repo.
+They cannot get a shell.
+
+Then add four repository secrets under Settings, Secrets and variables, Actions:
+
+| Secret | Value |
+| --- | --- |
+| `DEPLOY_SSH_KEY` | the whole of `/root/.ssh/deploy`, the private half |
+| `DEPLOY_HOST` | the server's IP |
+| `DEPLOY_USER` | `root` |
+| `DEPLOY_PORT` | `2200`, or whatever you moved sshd to |
+| `DEPLOY_KNOWN_HOSTS` | output of `ssh-keyscan -p 2200 <ip>` |
+
+`DEPLOY_KNOWN_HOSTS` pins the server's host key so the deploy will not connect to
+an impostor. Skipping it would mean blindly trusting whatever answers on that
+address.
+
+To deploy by hand, or to check it works before wiring up CI:
+
+```sh
+ssh -p 2200 root@<ip> 'true'      # the forced command runs regardless
+```
+
+The script refuses to run if the checkout has uncommitted changes, so it can never
+silently throw away a hotfix somebody applied on the box. It waits for the
+container's healthcheck to pass and dumps the last 40 log lines if it does not, so
+a failed deploy shows up in the Actions log rather than as a quietly dead server.
+
 ## Development
 
 ```sh

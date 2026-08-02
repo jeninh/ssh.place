@@ -60,3 +60,40 @@ jobs:
       - uses: actions/checkout@v4
       - name: build image
         run: docker build -t sshplace:ci .
+
+  # Redeploy the live server, but only from main and only once everything above
+  # has passed. That gating is the point: a push that breaks the tests should
+  # never reach the box.
+  deploy:
+    needs: [test, vulncheck, docker]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    # One deploy at a time, and let a newer push supersede one that is queued.
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    steps:
+      - name: Redeploy over SSH
+        env:
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          USER: ${{ secrets.DEPLOY_USER }}
+          PORT: ${{ secrets.DEPLOY_PORT }}
+          KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/deploy
+          chmod 600 ~/.ssh/deploy
+          # Pin the host key. Without this the first connection would have to
+          # trust whatever answers, which is exactly the attack this protects.
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+          # No command is sent on purpose. The server's authorized_keys pins a
+          # forced command, so this key can only ever trigger a redeploy.
+          ssh -i ~/.ssh/deploy \
+              -o UserKnownHostsFile=~/.ssh/known_hosts \
+              -o StrictHostKeyChecking=yes \
+              -o ConnectTimeout=15 \
+              -p "${PORT:-22}" "$USER@$HOST"
