@@ -7,6 +7,8 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/muesli/termenv"
+
+	"github.com/jeninh/ssh.place/internal/canvas"
 )
 
 func TestBorderAt(t *testing.T) {
@@ -543,5 +545,116 @@ func TestScrollReversalDoesNotJump(t *testing.T) {
 	h.send(wheel(tea.MouseButtonWheelUp))
 	if h.model.curY != y0 {
 		t.Errorf("cursor at %d after down-then-up, want %d", h.model.curY, y0)
+	}
+}
+
+// --- cursor visibility ---
+
+// The cursor used to be reverse video, which is invisible on a solid block: a
+// block sets its foreground and its fill to the same color, so swapping them
+// changes nothing. Since the canvas is blocks-only by default, that meant the
+// cursor vanished on every cell anyone had drawn.
+func TestCursorIsVisibleOnEveryColor(t *testing.T) {
+	for c := 0; c < canvas.PaletteSize; c++ {
+		h := newHarnessProfile(t, termenv.ANSI)
+		if err := h.app.Canvas.Fill(0, 0, uint8(c)); err != nil {
+			t.Fatal(err)
+		}
+		h.model.curX, h.model.curY = 0, 0
+		h.flush()
+
+		key, glyph := h.model.styleFor(0, 0, canvas.Block(uint8(c)), h.clock.now(), false)
+
+		if glyph != cursorGlyph {
+			t.Errorf("color %d: cursor drew %q, want %q", c, rune(glyph), rune(cursorGlyph))
+		}
+		// The whole bug: marker and background must not be the same color.
+		if key.bg == bgOfFill(uint8(c)) && key.fg == uint8(c) {
+			t.Errorf("color %d (%s): cursor marker is the same color as the block it sits on",
+				c, canvas.Palette[c].Name)
+		}
+		if key.fg != cursorOnDark && key.fg != cursorOnLight {
+			t.Errorf("color %d: cursor fg = %d, want white (%d) or black (%d)",
+				c, key.fg, cursorOnDark, cursorOnLight)
+		}
+	}
+}
+
+// White gets a black marker, black gets a white one.
+func TestCursorPicksContrastByLuminance(t *testing.T) {
+	cases := []struct {
+		color uint8
+		want  uint8
+		why   string
+	}{
+		{15, cursorOnLight, "white"},
+		{11, cursorOnLight, "yellow"},
+		{14, cursorOnLight, "aqua"},
+		{10, cursorOnLight, "lime"},
+		{0, cursorOnDark, "black"},
+		{4, cursorOnDark, "navy"},
+		{1, cursorOnDark, "maroon"},
+		{5, cursorOnDark, "purple"},
+	}
+	for _, tc := range cases {
+		if got := cursorFg(bgOfFill(tc.color)); got != tc.want {
+			t.Errorf("%s (palette %d): marker = %d, want %d", tc.why, tc.color, got, tc.want)
+		}
+	}
+	// An unfilled cell shows the terminal background, which we assume is dark.
+	if got := cursorFg(bgNone); got != cursorOnDark {
+		t.Errorf("cursor on empty canvas = %d, want white (%d)", got, cursorOnDark)
+	}
+}
+
+// The cursor must not hide what is underneath it: the cell keeps its own color
+// and only the marker is drawn on top.
+func TestCursorKeepsTheCellColorVisible(t *testing.T) {
+	h := newHarnessProfile(t, termenv.ANSI)
+	const color = 9 // red
+	if err := h.app.Canvas.Fill(5, 3, color); err != nil {
+		t.Fatal(err)
+	}
+	h.model.curX, h.model.curY = 5, 3
+	h.flush()
+
+	key, _ := h.model.styleFor(5, 3, canvas.Block(color), h.clock.now(), false)
+	if key.bg != bgOfFill(color) {
+		t.Errorf("cursor cell bg = %d, want the block's own color slot %d", key.bg, bgOfFill(color))
+	}
+}
+
+// On blank canvas and on characters, reverse video is used instead: it is
+// visible there and, unlike the marker, does not cover up what is underneath.
+func TestCursorUsesReverseWhereItWorks(t *testing.T) {
+	h := newHarnessProfile(t, termenv.ANSI)
+	h.model.curX, h.model.curY = 4, 2
+	h.flush()
+
+	// An untouched cell.
+	blank := canvas.Cell{Rune: canvas.Empty, Color: canvas.DefaultColor, Fill: canvas.NoFill}
+	key, glyph := h.model.styleFor(4, 2, blank, h.clock.now(), false)
+	if key.decor != decorReverse {
+		t.Errorf("cursor on empty cell decor = %d, want reverse (%d)", key.decor, decorReverse)
+	}
+	if glyph != canvas.Empty {
+		t.Errorf("cursor on empty cell drew %q, want it left alone", rune(glyph))
+	}
+	if !strings.Contains(h.frame(), buildSeq(canvas.DefaultColor, bgNone, decorReverse)) {
+		t.Error("frame has no reverse-video cursor")
+	}
+}
+
+// The cursor must not hide a character it is sitting on.
+func TestCursorDoesNotCoverACharacter(t *testing.T) {
+	h := newHarnessProfile(t, termenv.ANSI)
+	h.model.curX, h.model.curY = 6, 1
+
+	key, glyph := h.model.styleFor(6, 1, canvas.Glyph('%', 9), h.clock.now(), false)
+	if glyph != '%' {
+		t.Errorf("cursor drew %q over the character, want '%%' still visible", rune(glyph))
+	}
+	if key.decor != decorReverse {
+		t.Errorf("decor = %d, want reverse so the character stays legible", key.decor)
 	}
 }

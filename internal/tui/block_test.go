@@ -491,3 +491,33 @@ func TestBlocksOnlyStatusShowsNoCharacter(t *testing.T) {
 		t.Errorf("status = %q, want no stamp character", status)
 	}
 }
+
+// A restart drops sessions from the hub rather than the player quitting, so the
+// farewell has to say that instead of thanking them for leaving.
+func TestHubCloseExplainsARestart(t *testing.T) {
+	h := newHarness(t)
+	h.send(hubClosedMsg{})
+
+	reason := h.exit.Reason()
+	if reason == "" {
+		t.Fatal("no exit reason set, so the user sees the generic farewell")
+	}
+	for _, want := range []string{"restarted", "ssh ssh.place"} {
+		if !strings.Contains(reason, want) {
+			t.Errorf("exit reason %q does not mention %q", reason, want)
+		}
+	}
+	// It should not read as though they chose to leave.
+	if strings.Contains(reason, "Thanks for drawing") {
+		t.Error("restart reuses the voluntary-quit farewell")
+	}
+}
+
+// Quitting on purpose must still get the friendly farewell, not the restart one.
+func TestVoluntaryQuitKeepsTheNormalFarewell(t *testing.T) {
+	h := newHarness(t)
+	h.send(runes('q'))
+	if got := h.exit.Reason(); got != "" {
+		t.Errorf("exit reason = %q after pressing q, want empty so the default is used", got)
+	}
+}

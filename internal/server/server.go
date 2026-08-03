@@ -224,7 +224,15 @@ func (s *Server) logConnections(next ssh.Handler) ssh.Handler {
 	return func(sess ssh.Session) {
 		start := time.Now()
 		ip := remoteIP(sess)
-		s.log.Info("session start", "ip", ip, "client", sess.Context().ClientVersion())
+		// The fingerprint goes in the log because the event log records identities
+		// with no address and this log recorded addresses with no identity, so
+		// neither could answer "which network is that placer on".
+		identity, keyed := "-", false
+		if hs, ok := sess.Context().Value(ctxKeySession).(*hub.Session); ok && hs != nil {
+			identity, keyed = hs.Identity, hs.Keyed
+		}
+		s.log.Info("session start", "ip", ip, "identity", identity, "keyed", keyed,
+			"client", sess.Context().ClientVersion())
 		next(sess)
 		s.log.Info("session end", "ip", ip, "duration", time.Since(start).Round(time.Second))
 	}

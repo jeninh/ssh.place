@@ -955,7 +955,7 @@ func TestExitIsNilSafe(t *testing.T) {
 func TestPainterWithoutColorPassesTextThrough(t *testing.T) {
 	p := newPainter(false)
 	var b strings.Builder
-	p.paint(&b, styleKey{fg: 9, bg: bgHlFresh, decor: decorCsr}, "abc")
+	p.paint(&b, styleKey{fg: 9, bg: bgHlFresh, decor: decorReverse}, "abc")
 	if got := b.String(); got != "abc" {
 		t.Errorf("paint = %q, want %q", got, "abc")
 	}
@@ -964,7 +964,7 @@ func TestPainterWithoutColorPassesTextThrough(t *testing.T) {
 func TestPainterEmitsCursorAndHighlight(t *testing.T) {
 	p := newPainter(true)
 	var b strings.Builder
-	p.paint(&b, styleKey{fg: 15, decor: decorCsr}, "x")
+	p.paint(&b, styleKey{fg: 15, decor: decorReverse}, "x")
 	out := b.String()
 	if !strings.Contains(out, "7") || !strings.HasSuffix(out, reset) {
 		t.Errorf("cursor cell = %q, want reverse video and a reset", out)
@@ -982,5 +982,27 @@ func TestPainterSequencesAreDistinct(t *testing.T) {
 			t.Errorf("palette entries %d and %d share the sequence %q", prev, i, seq)
 		}
 		seen[seq] = i
+	}
+}
+
+func TestAdminStatusBarShowsNoCooldown(t *testing.T) {
+	h := newHarness(t, func(c *Config) {
+		// The harness session's identity, granted the exemption.
+		c.App.Admins = map[string]bool{"key-a": true}
+	})
+
+	if !strings.Contains(h.status(), "no cooldown") {
+		t.Errorf("status = %q, want it to show %q", h.status(), "no cooldown")
+	}
+
+	// Placing must not start a countdown: an admin that appears to be cooling
+	// down is worse than no indicator, because it is wrong.
+	h.press(special(tea.KeyEnter))
+	h.flush()
+	if got := h.status(); !strings.Contains(got, "no cooldown") {
+		t.Errorf("status after placing = %q, want it to still show %q", got, "no cooldown")
+	}
+	if left := h.model.cooldownLeft(h.clock.now()); left != 0 {
+		t.Errorf("cooldownLeft = %s, want 0", left)
 	}
 }

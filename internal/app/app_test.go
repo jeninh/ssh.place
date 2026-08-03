@@ -538,3 +538,315 @@ func TestSeparateIPv6BlocksKeepSeparateBudgets(t *testing.T) {
 		t.Errorf("%d of 10 distinct /64s could place, want all of them", landed)
 	}
 }
+
+// adminKey is the fingerprint the exemption tests grant. Real fingerprints are
+// this shape, and only this shape is accepted.
+const adminKey = "SHA256:aaaabbbbccccddddeeeeffff0000111122223333444"
+
+func withAdmin(fingerprint string) func(*fixture) {
+	return func(f *fixture) {
+		f.app.Admins = map[string]bool{fingerprint: true}
+	}
+}
+
+// withTightLimits makes every one of the three limits bite immediately, so a
+// test that gets more than one placement through can only have bypassed all of
+// them.
+func withTightLimits(f *fixture) {
+	f.app.Limiter = ratelimit.New(testCooldown, 1, time.Hour,
+		ratelimit.WithGlobalRate(1, 1))
+}
+
+func TestAdminKeyHasNoCooldown(t *testing.T) {
+	f := newFixture(t, withAdmin(adminKey), withTightLimits)
+	admin := f.session(t, "1.1.1.1", adminKey)
+
+	// Every placement at the same instant: no wall clock passes, so nothing can
+	// have refilled. A limited identity would get exactly one.
+	const want = 50
+	for i := 0; i < want; i++ {
+		if retry, err := f.app.Place(admin, i%40, i/40, canvas.Block(3), base); err != nil {
+			t.Fatalf("Place %d = %v (retry %s), want nil", i, err, retry)
+		}
+	}
+
+	for i := 0; i < want; i++ {
+		if cell, ok := f.app.Canvas.At(i%40, i/40); !ok || cell.Color != 3 {
+			t.Errorf("cell %d,%d = %+v, want color 3", i%40, i/40, cell)
+		}
+	}
+	if left := f.app.CooldownLeft(admin, base); left != 0 {
+		t.Errorf("CooldownLeft = %s, want 0 for an admin", left)
+	}
+}
+
+func TestAdminBypassIsPerKeyNotServerWide(t *testing.T) {
+	f := newFixture(t, withAdmin(adminKey), withTightLimits)
+	admin := f.session(t, "1.1.1.1", adminKey)
+	other := f.session(t, "2.2.2.2", "SHA256:someoneelse")
+
+	if _, err := f.app.Place(admin, 0, 0, canvas.Block(1), base); err != nil {
+		t.Fatalf("admin Place = %v, want nil", err)
+	}
+	// Granting an exemption to one key must not lift the limits for anyone else.
+	if _, err := f.app.Place(other, 1, 0, canvas.Block(2), base); err != nil {
+		t.Fatalf("first Place for a normal key = %v, want nil", err)
+	}
+	if _, err := f.app.Place(other, 2, 0, canvas.Block(2), base); err == nil {
+		t.Fatal("second Place for a normal key succeeded, want it refused")
+	}
+}
+
+func TestAdminPlacementsDoNotSpendOthersBudget(t *testing.T) {
+	// The admin skips Reserve entirely rather than being refunded, so heavy
+	// admin activity must not eat the global ceiling everyone shares.
+	f := newFixture(t, withAdmin(adminKey),
+		func(f *fixture) {
+			f.app.Limiter = ratelimit.New(testCooldown, 1_000_000, time.Nanosecond,
+				ratelimit.WithGlobalRate(1, 1))
+		})
+	admin := f.session(t, "1.1.1.1", adminKey)
+	other := f.session(t, "2.2.2.2", "SHA256:someoneelse")
+
+	for i := 0; i < 200; i++ {
+		if _, err := f.app.Place(admin, i%40, i/40, canvas.Block(5), base); err != nil {
+			t.Fatalf("admin Place %d = %v, want nil", i, err)
+		}
+	}
+	// The global bucket still holds its single token.
+	if _, err := f.app.Place(other, 0, 9, canvas.Block(6), base); err != nil {
+		t.Errorf("Place after 200 admin writes = %v, want nil", err)
+	}
+}
+
+func TestAdminRequiresARealKey(t *testing.T) {
+	f := newFixture(t, withAdmin(adminKey), withTightLimits)
+
+	// A keyless client is identified by network. If that string could ever match
+	// an admin entry, everyone sharing the network would inherit the exemption.
+	keyless, err := f.app.Hub.Add("1.1.1.1", adminKey, false)
+	if err != nil {
+		t.Fatalf("add session: %v", err)
+	}
+	t.Cleanup(func() { f.app.Hub.Remove(keyless) })
+
+	if f.app.IsAdmin(keyless) {
+		t.Fatal("IsAdmin = true for a keyless session, want false")
+	}
+	if _, err := f.app.Place(keyless, 0, 0, canvas.Block(1), base); err != nil {
+		t.Fatalf("first Place = %v, want nil", err)
+	}
+	if _, err := f.app.Place(keyless, 1, 0, canvas.Block(1), base); err == nil {
+		t.Fatal("second Place succeeded, want the keyless session rate limited")
+	}
+}
+
+func TestAdminStillValidated(t *testing.T) {
+	// The exemption is about pacing only. Everything that protects the canvas
+	// itself still applies, or an admin session becomes a way to write control
+	// characters and escape sequences into cells other people render.
+	f := newFixture(t, withAdmin(adminKey), blocksOnly)
+	admin := f.session(t, "1.1.1.1", adminKey)
+
+	if _, err := f.app.Place(admin, 0, 0, canvas.Glyph('A', 1), base); !errors.Is(err, ErrCharactersDisabled) {
+		t.Errorf("Place character = %v, want ErrCharactersDisabled", err)
+	}
+	if _, err := f.app.Place(admin, 999, 999, canvas.Block(1), base); !errors.Is(err, canvas.ErrOutOfBounds) {
+		t.Errorf("Place out of bounds = %v, want ErrOutOfBounds", err)
+	}
+	if _, err := f.app.Place(admin, 0, 0, canvas.Glyph('\x1b', 1), base); err == nil {
+		t.Error("Place escape character succeeded, want it refused")
+	}
+}
+
+func TestNoAdminsConfiguredMeansNoExemptions(t *testing.T) {
+	f := newFixture(t, withTightLimits)
+	s := f.session(t, "1.1.1.1", adminKey)
+
+	if f.app.IsAdmin(s) {
+		t.Fatal("IsAdmin = true with no Admins configured, want false")
+	}
+	if _, err := f.app.Place(s, 0, 0, canvas.Block(1), base); err != nil {
+		t.Fatalf("first Place = %v, want nil", err)
+	}
+	if _, err := f.app.Place(s, 1, 0, canvas.Block(1), base); err == nil {
+		t.Fatal("second Place succeeded, want it refused")
+	}
+}
+
+const botKey = "SHA256:bbbbccccddddeeeeffff00001111222233334444555"
+
+func withBlocked(fingerprints ...string) func(*fixture) {
+	return func(f *fixture) {
+		f.app.Blocked = make(map[string]bool, len(fingerprints))
+		for _, fp := range fingerprints {
+			f.app.Blocked[fp] = true
+		}
+	}
+}
+
+func TestBlockedKeyCannotPlace(t *testing.T) {
+	f := newFixture(t, withBlocked(botKey))
+	bot := f.session(t, "1.1.1.1", botKey)
+
+	if !f.app.IsBlocked(bot) {
+		t.Fatal("IsBlocked = false, want true")
+	}
+	retry, err := f.app.Place(bot, 3, 3, canvas.Block(4), base)
+	if !errors.Is(err, ErrKeyBlocked) {
+		t.Fatalf("Place = %v, want ErrKeyBlocked", err)
+	}
+	// Nothing to wait for, so offering a retry time would be a lie.
+	if retry != 0 {
+		t.Errorf("retryAfter = %s, want 0", retry)
+	}
+	if cell, ok := f.app.Canvas.At(3, 3); ok && cell.Drawn() {
+		t.Errorf("cell was written despite the block: %+v", cell)
+	}
+	// Waiting must not help. This is the difference between a block and a
+	// cooldown, and a bot will absolutely test it.
+	if _, err := f.app.Place(bot, 3, 3, canvas.Block(4), base.Add(time.Hour)); !errors.Is(err, ErrKeyBlocked) {
+		t.Errorf("Place an hour later = %v, want ErrKeyBlocked", err)
+	}
+}
+
+func TestBlockedBeatsAdmin(t *testing.T) {
+	// Contradictory config should fail closed, and main warns about it at boot.
+	f := newFixture(t, withAdmin(botKey), withBlocked(botKey))
+	s := f.session(t, "1.1.1.1", botKey)
+
+	if _, err := f.app.Place(s, 0, 0, canvas.Block(1), base); !errors.Is(err, ErrKeyBlocked) {
+		t.Errorf("Place = %v, want ErrKeyBlocked to win over the exemption", err)
+	}
+}
+
+func TestBlockingOneKeyLeavesOthersAlone(t *testing.T) {
+	f := newFixture(t, withBlocked(botKey))
+	bot := f.session(t, "1.1.1.1", botKey)
+	human := f.session(t, "2.2.2.2", "SHA256:areallyperson")
+
+	for i := 0; i < 5; i++ {
+		if _, err := f.app.Place(bot, i, 0, canvas.Block(1), base); !errors.Is(err, ErrKeyBlocked) {
+			t.Fatalf("bot Place = %v, want ErrKeyBlocked", err)
+		}
+	}
+	// A refused block consumes no budget, so it cannot be used to starve anyone.
+	if _, err := f.app.Place(human, 0, 1, canvas.Block(2), base); err != nil {
+		t.Errorf("human Place = %v, want nil", err)
+	}
+}
+
+func TestNoBlockListMeansNobodyBlocked(t *testing.T) {
+	f := newFixture(t)
+	s := f.session(t, "1.1.1.1", botKey)
+
+	if f.app.IsBlocked(s) {
+		t.Fatal("IsBlocked = true with no block list, want false")
+	}
+	if _, err := f.app.Place(s, 0, 0, canvas.Block(1), base); err != nil {
+		t.Errorf("Place = %v, want nil", err)
+	}
+}
+
+func withSlowed(factor float64, fingerprints ...string) func(*fixture) {
+	return func(f *fixture) {
+		f.app.SlowFactor = factor
+		f.app.Slowed = make(map[string]bool, len(fingerprints))
+		for _, fp := range fingerprints {
+			f.app.Slowed[fp] = true
+		}
+	}
+}
+
+func TestSlowedKeyWaitsLongerButStillPlays(t *testing.T) {
+	f := newFixture(t, withSlowed(4, botKey))
+	bot := f.session(t, "1.1.1.1", botKey)
+
+	// The point of slowing rather than blocking: the first placement still lands.
+	if _, err := f.app.Place(bot, 0, 0, canvas.Block(1), base); err != nil {
+		t.Fatalf("first Place = %v, want nil", err)
+	}
+
+	// At the normal cooldown it is still waiting.
+	retry, err := f.app.Place(bot, 1, 0, canvas.Block(1), base.Add(testCooldown))
+	if !errors.Is(err, ErrCooldown) {
+		t.Fatalf("Place at the normal cooldown = %v, want ErrCooldown", err)
+	}
+	if want := 3 * testCooldown; retry != want {
+		t.Errorf("retryAfter = %s, want %s", retry, want)
+	}
+
+	// At four times the cooldown it goes through.
+	if _, err := f.app.Place(bot, 1, 0, canvas.Block(1), base.Add(4*testCooldown)); err != nil {
+		t.Errorf("Place at 4x cooldown = %v, want nil", err)
+	}
+	if cell, ok := f.app.Canvas.At(1, 0); !ok || !cell.Drawn() {
+		t.Error("slowed key could not draw at all, want it slowed not blocked")
+	}
+}
+
+func TestSlowedCountdownMatchesWhatTheServerAccepts(t *testing.T) {
+	// A countdown that lies is worse than a slow one: the player would sit there
+	// pressing a key that keeps being refused.
+	f := newFixture(t, withSlowed(4, botKey))
+	bot := f.session(t, "1.1.1.1", botKey)
+
+	if _, err := f.app.Place(bot, 0, 0, canvas.Block(1), base); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := f.app.CooldownLeft(bot, base), 4*testCooldown; got != want {
+		t.Errorf("CooldownLeft = %s, want %s", got, want)
+	}
+	if got := f.app.CooldownLeft(bot, base.Add(4*testCooldown)); got != 0 {
+		t.Errorf("CooldownLeft after the slowed window = %s, want 0", got)
+	}
+}
+
+func TestSlowingOnlyTouchesListedKeys(t *testing.T) {
+	f := newFixture(t, withSlowed(4, botKey))
+	bot := f.session(t, "1.1.1.1", botKey)
+	human := f.session(t, "2.2.2.2", "SHA256:areallyperson")
+
+	for _, s := range []*hub.Session{bot, human} {
+		if _, err := f.app.Place(s, 0, 0, canvas.Block(1), base); err != nil {
+			t.Fatalf("first Place = %v, want nil", err)
+		}
+	}
+	// One cooldown later the human is ready and the bot is not.
+	at := base.Add(testCooldown)
+	if _, err := f.app.Place(human, 1, 1, canvas.Block(2), at); err != nil {
+		t.Errorf("human Place = %v, want nil", err)
+	}
+	if _, err := f.app.Place(bot, 2, 2, canvas.Block(2), at); !errors.Is(err, ErrCooldown) {
+		t.Errorf("bot Place = %v, want ErrCooldown", err)
+	}
+}
+
+func TestSlowFactorOneOrZeroDoesNothing(t *testing.T) {
+	// An unset factor must be harmless, or forgetting it silently changes the
+	// pacing for whoever is on the list.
+	for _, factor := range []float64{0, 1} {
+		f := newFixture(t, withSlowed(factor, botKey))
+		bot := f.session(t, "1.1.1.1", botKey)
+		if f.app.IsSlowed(bot) {
+			t.Errorf("factor %v: IsSlowed = true, want false", factor)
+		}
+		if _, err := f.app.Place(bot, 0, 0, canvas.Block(1), base); err != nil {
+			t.Fatalf("factor %v: Place = %v", factor, err)
+		}
+		if _, err := f.app.Place(bot, 1, 0, canvas.Block(1), base.Add(testCooldown)); err != nil {
+			t.Errorf("factor %v: Place at normal cooldown = %v, want nil", factor, err)
+		}
+	}
+}
+
+func TestAdminBeatsSlowing(t *testing.T) {
+	f := newFixture(t, withAdmin(adminKey), withSlowed(4, adminKey))
+	s := f.session(t, "1.1.1.1", adminKey)
+
+	for i := 0; i < 5; i++ {
+		if _, err := f.app.Place(s, i, 0, canvas.Block(1), base); err != nil {
+			t.Fatalf("Place %d = %v, want the exemption to win", i, err)
+		}
+	}
+}

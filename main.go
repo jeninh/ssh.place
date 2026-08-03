@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -44,8 +45,20 @@ type config struct {
 	logLevel    string
 	mode        string
 	minFill     time.Duration
+	adminKeys   string
+	blockedKeys string
+	slowKeys    string
+	slowFactor  float64
 	healthcheck string
 }
+
+// shutdownGrace is how long to let sessions finish before dropping them.
+//
+// Kept well inside the container runtime's own stop timeout, which defaults to
+// ten seconds and then SIGKILLs. Interactive sessions never finish voluntarily,
+// so a long wait here only delays the exit and risks the process being killed
+// mid-cleanup.
+const shutdownGrace = 2 * time.Second
 
 func parseFlags() config {
 	var c config
@@ -65,6 +78,10 @@ func parseFlags() config {
 	flag.StringVar(&c.webURL, "web-url", envOr("SSHPLACE_WEB_URL", "https://ssh.place"), "URL shown in the in-session help text")
 	flag.DurationVar(&c.minFill, "min-board-fill", time.Hour, "floor on how long repainting every cell of the canvas can take, whatever a client controls (0 disables the ceiling)")
 	flag.StringVar(&c.mode, "mode", envOr("SSHPLACE_MODE", "blocks"), `"blocks" for solid color only, or "mixed" to also allow characters`)
+	flag.StringVar(&c.adminKeys, "admin-keys", envOr("SSHPLACE_ADMIN_KEYS", ""), "comma separated SSH key fingerprints exempt from every rate limit, e.g. SHA256:abc...")
+	flag.StringVar(&c.blockedKeys, "blocked-keys", envOr("SSHPLACE_BLOCKED_KEYS", ""), "comma separated SSH key fingerprints refused at placement time")
+	flag.StringVar(&c.slowKeys, "slow-keys", envOr("SSHPLACE_SLOW_KEYS", ""), "comma separated SSH key fingerprints put on a longer cooldown instead of being blocked")
+	flag.Float64Var(&c.slowFactor, "slow-factor", 4, "multiplier on -cooldown for -slow-keys (1 disables the slowing)")
 	flag.StringVar(&c.logLevel, "log-level", envOr("SSHPLACE_LOG_LEVEL", "info"), "log level: debug, info, warn or error")
 	flag.StringVar(&c.healthcheck, "healthcheck", "", "probe this URL, exit 0 if healthy, then stop; for container health checks")
 	flag.Parse()
@@ -156,6 +173,37 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
+// parseFingerprints turns a comma separated flag into a lookup set.
+//
+// Fingerprints are not secrets, so there is nothing to protect here beyond
+// being strict about the format: a typo would otherwise silently grant nobody
+// anything, and you would only find out when you needed it.
+func parseFingerprints(raw string) (map[string]bool, []string) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	set := make(map[string]bool)
+	var bad []string
+	for _, f := range strings.Split(raw, ",") {
+		f = strings.TrimSpace(f)
+		if f == "" {
+			continue
+		}
+		// This is the exact form `ssh-keygen -lf` prints and the form the SSH
+		// server computes at auth time. Anything else can never match, so say so
+		// at boot rather than failing silently under pressure.
+		if !strings.HasPrefix(f, "SHA256:") {
+			bad = append(bad, f)
+			continue
+		}
+		set[f] = true
+	}
+	if len(set) == 0 {
+		return nil, bad
+	}
+	return set, bad
+}
+
 func main() {
 	cfg := parseFlags()
 
@@ -222,12 +270,36 @@ func run(cfg config) error {
 	limiter := ratelimit.New(cfg.cooldown, cfg.ipBurst, ipRefill,
 		ratelimit.WithGlobalRate(globalRate, globalBurst))
 
+	admins, badAdmins := parseFingerprints(cfg.adminKeys)
+	for _, f := range badAdmins {
+		// Not fatal: a bad entry should not stop the canvas from coming up.
+		logger.Warn("ignoring admin key, not a SHA256 fingerprint", "value", f)
+	}
+	slowed, badSlowed := parseFingerprints(cfg.slowKeys)
+	for _, f := range badSlowed {
+		logger.Warn("ignoring slow key, not a SHA256 fingerprint", "value", f)
+	}
+	blocked, badBlocked := parseFingerprints(cfg.blockedKeys)
+	for _, f := range badBlocked {
+		logger.Warn("ignoring blocked key, not a SHA256 fingerprint", "value", f)
+	}
+	// A key that is both exempt and blocked is a config mistake worth shouting
+	// about, because Place resolves it as blocked and the operator probably meant
+	// the opposite.
+	for f := range admins {
+		if blocked[f] {
+			logger.Warn("key is both admin and blocked, treating as blocked", "key", f)
+		}
+	}
+
 	logger.Info("canvas ready",
 		"width", cfg.width, "height", cfg.height,
 		"drawn", board.NonEmpty(), "mode", cfg.mode,
 		"cooldown", cfg.cooldown, "ip_refill", ipRefill,
 		"max_placements_per_sec", fmt.Sprintf("%.2f", globalRate),
-		"min_board_fill", cfg.minFill, "snapshot", snapshotPath)
+		"min_board_fill", cfg.minFill, "snapshot", snapshotPath,
+		"admin_keys", len(admins), "blocked_keys", len(blocked),
+		"slow_keys", len(slowed), "slow_cooldown", time.Duration(float64(cfg.cooldown)*cfg.slowFactor))
 	a := &app.App{
 		Canvas:     board,
 		Hub:        hub.New(cfg.maxSessions, cfg.maxPerIP),
@@ -235,6 +307,10 @@ func run(cfg config) error {
 		Log:        events,
 		Logger:     logger,
 		BlocksOnly: blocksOnly,
+		Admins:     admins,
+		Blocked:    blocked,
+		Slowed:     slowed,
+		SlowFactor: cfg.slowFactor,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -316,7 +392,23 @@ func run(cfg config) error {
 	}
 	stop() // unblock the background loops even if we got here via serveErr
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// Save first. Everyone drawing is sitting in a full-screen TUI that will
+	// never close on its own, so waiting for sessions before saving burns the
+	// whole shutdown budget on a wait that cannot succeed, and the container
+	// runtime SIGKILLs us before the canvas reaches disk.
+	saveCanvas := func(stage string) {
+		if err := board.Save(snapshotPath); err != nil {
+			logger.Error("snapshot", "stage", stage, "err", err)
+			if runErr == nil {
+				runErr = err
+			}
+			return
+		}
+		logger.Info("snapshot saved", "stage", stage, "drawn", board.NonEmpty())
+	}
+	saveCanvas("shutdown")
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
 	defer cancel()
 
 	if httpSrv != nil {
@@ -325,9 +417,8 @@ func run(cfg config) error {
 		}
 	}
 	if err := sshSrv.Shutdown(shutdownCtx); err != nil {
-		// Sessions still in the alternate screen will not close on their own;
-		// drop them rather than hang the process.
-		logger.Warn("ssh shutdown timed out, closing connections", "err", err)
+		// Expected, not exceptional: interactive sessions do not end themselves.
+		logger.Info("dropping live sessions", "after", shutdownGrace)
 		if err := sshSrv.Close(); err != nil {
 			logger.Error("ssh close", "err", err)
 		}
@@ -335,15 +426,9 @@ func run(cfg config) error {
 
 	background.Wait()
 
-	// The last save happens after every session is gone, so nothing is lost.
-	if err := board.Save(snapshotPath); err != nil {
-		logger.Error("final snapshot", "err", err)
-		if runErr == nil {
-			runErr = err
-		}
-	} else {
-		logger.Info("snapshot saved", "path", snapshotPath, "drawn", board.NonEmpty())
-	}
+	// Again at the very end, in case anything landed while sessions were being
+	// closed. Writing a 36 KB file twice costs nothing.
+	saveCanvas("final")
 	return runErr
 }
 

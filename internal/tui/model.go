@@ -225,7 +225,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(m.repaint(now, false), waitForUpdate(m.sess.Updates()))
 
 	case hubClosedMsg:
-		// The hub dropped us: the session is shutting down.
+		// The hub dropped us rather than the player leaving, which in practice
+		// means the server is restarting. Say so: the default farewell reads as
+		// though they chose to go, and does not tell them to come straight back.
+		m.exit.Set("ssh.place restarted. Your canvas is safe, hop back on: ssh ssh.place")
 		m.quitting = true
 		return m, tea.Quit
 
@@ -527,7 +530,12 @@ func (m *Model) place(now time.Time) {
 	retryAfter, err := m.app.Place(m.sess, m.curX, m.curY, m.cell(), now)
 	switch {
 	case err == nil:
-		m.cooldownUntil = now.Add(m.app.Cooldown())
+		// An exempt key must not arm the local countdown either. The status bar
+		// hides it, but anything else reading this state would throttle a session
+		// the server is happy to accept.
+		if !m.app.IsAdmin(m.sess) {
+			m.cooldownUntil = now.Add(m.app.Cooldown())
+		}
 		m.flash, m.flashUntil = "", time.Time{}
 	case errors.Is(err, app.ErrCooldown):
 		m.cooldownUntil = now.Add(retryAfter)
@@ -652,7 +660,22 @@ func (m *Model) styleFor(x, y int, cell canvas.Cell, now time.Time, hasRecent bo
 	if g, ok := borderAt(x, y, m.canvasW, m.canvasH); ok {
 		return styleKey{fg: borderColor, bg: bgNone}, g
 	}
-	return m.keyFor(x, y, cell, now, hasRecent), m.glyphFor(cell)
+
+	k := m.keyFor(x, y, cell, now, hasRecent)
+	if k.decor != decorNone {
+		// On a solid block the foreground and fill are the same color, so reverse
+		// video would swap a color with itself and the cursor would vanish. Keep
+		// the block's color and stamp a contrasting marker on it.
+		if cell.IsBlock() {
+			k.fg = cursorFg(k.bg)
+			k.decor = decorBold
+			return k, cursorGlyph
+		}
+		// Anywhere else reverse video is both visible and non-destructive: the
+		// character under the cursor stays readable instead of being covered up.
+		k.decor = decorReverse
+	}
+	return k, m.glyphFor(cell)
 }
 
 // glyphFor returns the byte to draw for a cell. A block carries no character; it
@@ -677,7 +700,8 @@ func (m *Model) keyFor(x, y int, cell canvas.Cell, now time.Time, hasRecent bool
 		k.bg = bgOfFill(cell.Fill)
 	}
 	if x == m.curX && y == m.curY {
-		k.decor = decorCsr
+		// Refined in styleFor, which knows whether reverse video will work here.
+		k.decor = decorReverse
 	}
 	// The marker and the fill share the one background slot, so a freshly
 	// placed block briefly shows the marker instead of its own color.
@@ -701,9 +725,15 @@ func (m *Model) statusBar(now time.Time, width int) string {
 		{text: m.stampLabel(), style: m.styles.swatch(m.color)},
 	}
 
-	if left := m.cooldownLeft(now); left > 0 {
-		segs = append(segs, segment{text: roundDur(left).String(), style: m.styles.cooling})
-	} else {
+	switch {
+	case m.app.IsAdmin(m.sess):
+		// Worth saying out loud rather than showing a permanent "ready": if the
+		// exemption ever stops applying, you find out from the status bar instead
+		// of from the canvas refusing you mid-cleanup.
+		segs = append(segs, segment{text: "no cooldown", style: m.styles.ready})
+	case m.cooldownLeft(now) > 0:
+		segs = append(segs, segment{text: roundDur(m.cooldownLeft(now)).String(), style: m.styles.cooling})
+	default:
 		segs = append(segs, segment{text: "ready", style: m.styles.ready})
 	}
 

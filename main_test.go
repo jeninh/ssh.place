@@ -188,3 +188,58 @@ func TestBoardCannotBeRepaintedFasterThanTheFloor(t *testing.T) {
 		t.Errorf("the whole board was repainted inside %s", window)
 	}
 }
+
+func TestParseAdminKeys(t *testing.T) {
+	tests := []struct {
+		name    string
+		raw     string
+		want    []string
+		wantBad []string
+	}{
+		{name: "empty", raw: ""},
+		{name: "blank", raw: "   "},
+		{name: "one", raw: "SHA256:abc", want: []string{"SHA256:abc"}},
+		{
+			name: "several with padding",
+			raw:  " SHA256:abc , SHA256:def ,, ",
+			want: []string{"SHA256:abc", "SHA256:def"},
+		},
+		{
+			// A typo must be visible at boot. Silently granting nobody anything is
+			// the failure you only discover when you need the exemption.
+			name:    "wrong format is reported",
+			raw:     "abc,SHA256:def",
+			want:    []string{"SHA256:def"},
+			wantBad: []string{"abc"},
+		},
+		{
+			// The full public key is the easy mistake to make: it is what you have
+			// in authorized_keys, and it is not a fingerprint.
+			name:    "public key is not a fingerprint",
+			raw:     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5 jenin@laptop",
+			wantBad: []string{"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5 jenin@laptop"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, bad := parseFingerprints(tt.raw)
+			if len(got) != len(tt.want) {
+				t.Fatalf("parsed %d keys (%v), want %d (%v)", len(got), got, len(tt.want), tt.want)
+			}
+			for _, f := range tt.want {
+				if !got[f] {
+					t.Errorf("missing %q from %v", f, got)
+				}
+			}
+			if len(bad) != len(tt.wantBad) {
+				t.Fatalf("bad = %v, want %v", bad, tt.wantBad)
+			}
+			for i, f := range tt.wantBad {
+				if bad[i] != f {
+					t.Errorf("bad[%d] = %q, want %q", i, bad[i], f)
+				}
+			}
+		})
+	}
+}

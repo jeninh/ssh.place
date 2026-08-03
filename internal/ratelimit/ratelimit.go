@@ -122,10 +122,19 @@ func (l *Limiter) Cooldown() time.Duration { return l.cooldown }
 // Nothing is consumed on refusal, so a client that hammers the key does not
 // push its own deadline further out.
 func (l *Limiter) Reserve(identity, ip string, now time.Time) (ok bool, retryAfter time.Duration, why Refusal) {
+	return l.ReserveFor(identity, ip, l.cooldown, now)
+}
+
+// ReserveFor is Reserve with the per-identity cooldown overridden, which is how
+// a slowed-down identity is paced without touching anybody else.
+//
+// Only the identity cooldown changes. The network budget and the global ceiling
+// are shared and are not the caller's to widen or narrow.
+func (l *Limiter) ReserveFor(identity, ip string, cooldown time.Duration, now time.Time) (ok bool, retryAfter time.Duration, why Refusal) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	if wait := l.identityWaitLocked(identity, now); wait > 0 {
+	if wait := l.identityWaitForLocked(identity, cooldown, now); wait > 0 {
 		return false, wait, RefusedCooldown
 	}
 
@@ -172,12 +181,18 @@ func (l *Limiter) waitFor(b *bucket, refill time.Duration) time.Duration {
 // Remaining reports how long identity must wait before its next placement,
 // ignoring the per-IP budget. The TUI calls this to draw its countdown.
 func (l *Limiter) Remaining(identity string, now time.Time) time.Duration {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.identityWaitLocked(identity, now)
+	return l.RemainingFor(identity, l.cooldown, now)
 }
 
-func (l *Limiter) identityWaitLocked(identity string, now time.Time) time.Duration {
+// RemainingFor is Remaining against an overridden cooldown, so a slowed identity
+// sees a countdown that matches what the server will actually accept.
+func (l *Limiter) RemainingFor(identity string, cooldown time.Duration, now time.Time) time.Duration {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.identityWaitForLocked(identity, cooldown, now)
+}
+
+func (l *Limiter) identityWaitForLocked(identity string, cooldown time.Duration, now time.Time) time.Duration {
 	last, seen := l.ids[identity]
 	if !seen {
 		return 0
@@ -187,7 +202,7 @@ func (l *Limiter) identityWaitLocked(identity string, now time.Time) time.Durati
 	if now.Before(last) {
 		return 0
 	}
-	if wait := l.cooldown - now.Sub(last); wait > 0 {
+	if wait := cooldown - now.Sub(last); wait > 0 {
 		return wait
 	}
 	return 0

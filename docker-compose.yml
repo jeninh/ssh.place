@@ -4,6 +4,9 @@ services:
     image: sshplace:latest
     container_name: sshplace
     restart: unless-stopped
+    # Comfortably more than the app needs, so a redeploy can never SIGKILL it
+    # part way through writing the canvas.
+    stop_grace_period: 30s
 
     ports:
       # Port 22 on the host is what makes `ssh ssh.place` work with no -p flag.

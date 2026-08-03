@@ -20,14 +20,60 @@ const (
 	bgHlFade      = bgHlFresh + 1                      // fading out
 	bgStates      = bgHlFade + 1
 
-	decorNone  = 0
-	decorCsr   = 1
-	decorCount = 2
+	decorNone = 0
+	// decorReverse is the cursor on a cell whose foreground and background
+	// differ, where swapping them is both visible and keeps the content legible.
+	decorReverse = 1
+	// decorBold is the cursor on a solid block, where reverse video would swap a
+	// color with itself. The marker supplies its own contrast, so it only needs
+	// emphasis.
+	decorBold  = 2
+	decorCount = 3
 )
 
 // bgOfFill returns the background slot for a block filled with the given
 // palette color.
 func bgOfFill(fill uint8) uint8 { return bgPaletteBase + fill&0x0f }
+
+// cursorGlyph marks where the cursor is. Deliberately not one of the frame
+// characters: a cursor that looks like a border corner is confusing when it sits
+// near one.
+//
+// The cursor used to be reverse video, which is invisible on a solid block: a
+// block sets its foreground and its fill to the same color, so swapping them
+// changes nothing. A marker in a deliberately contrasting color shows up on
+// every color in the palette, and keeps the cell's own color visible underneath
+// rather than blanking it.
+const cursorGlyph = 'x'
+
+// Contrast colors for the cursor marker: white on dark cells, black on light
+// ones.
+const (
+	cursorOnDark  = 15 // white
+	cursorOnLight = 0  // black
+)
+
+// paletteIsLight reports whether a palette entry is bright enough that a black
+// marker reads better on it than a white one. Uses the standard luminance
+// weighting rather than a plain average, because the eye is far more sensitive
+// to green than to blue.
+func paletteIsLight(i uint8) bool {
+	c := canvas.Palette[i&0x0f].RGB
+	lum := 0.2126*float64(c.R) + 0.7152*float64(c.G) + 0.0722*float64(c.B)
+	return lum > 140
+}
+
+// cursorFg picks the marker color for a cursor sitting on the given background.
+func cursorFg(bg uint8) uint8 {
+	if bg >= bgPaletteBase && bg < bgPaletteBase+canvas.PaletteSize {
+		if paletteIsLight(bg - bgPaletteBase) {
+			return cursorOnLight
+		}
+	}
+	// An unfilled cell shows the terminal's own background, which we cannot
+	// measure. Assume dark: overwhelmingly the common case for a terminal.
+	return cursorOnDark
+}
 
 // styleKey packs everything that affects a cell's appearance into one
 // comparable value, so the renderer emits one escape sequence per run of
@@ -95,8 +141,11 @@ func buildSeq(fg, bg, decor uint8) string {
 		parts = append(parts, bgCode(canvas.Palette[(bg-bgPaletteBase)&0x0f].ANSI))
 	}
 
-	if decor == decorCsr {
-		parts = append(parts, "7") // reverse video
+	switch decor {
+	case decorReverse:
+		parts = append(parts, "7")
+	case decorBold:
+		parts = append(parts, "1")
 	}
 
 	return "\x1b[" + strings.Join(parts, ";") + "m"

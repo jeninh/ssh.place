@@ -137,6 +137,9 @@ on it.
 | Concurrent sessions | 500 | `-max-sessions` |
 | Sessions per network | 5 | `-max-per-ip` |
 | Idle disconnect | 30 min | `-idle-timeout` |
+| Keys exempt from all of it | none | `-admin-keys` |
+| Keys on a longer cooldown | none | `-slow-keys`, `-slow-factor` |
+| Keys refused outright | none | `-blocked-keys` |
 | Unauthenticated connection | 20s | fixed |
 | Accepted connections | 4 x `-max-sessions` | fixed |
 
@@ -178,6 +181,100 @@ under the default. Watchers cost nothing.
 There's a real tradeoff here. Past that point the canvas is genuinely at its limit
 and starts saying no. It tells you which limit it was rather than blaming your own
 cooldown, but it's still a no. 
+
+### Running it yourself: the exempt key
+
+`-admin-keys` takes a comma separated list of SSH key fingerprints, the
+`SHA256:...` form that `ssh-keygen -lf ~/.ssh/id_ed25519.pub` prints. Those keys
+skip all three limits.
+
+This exists because moderation at one cell every 15 seconds isn't moderation. If
+somebody draws something vile at 3am, whoever runs the server needs to be able to
+paint over it in one sitting rather than 40 minutes.
+
+It's deliberately narrow:
+
+- Server side only. There's no client, message or username that can claim it, so
+  the exemption can't be requested, only configured.
+- Only real public keys. Clients that connect without one are identified by network,
+  and granting privileges against that would hand it to everyone sharing the network.
+- Pacing only. Bounds, printable-ASCII and blocks-only still apply, so an exempt
+  session is not a way to write escape sequences into cells other people render.
+- Skips the limits rather than being refunded by them, so an exempt key drawing hard
+  doesn't eat the budget everyone else is sharing.
+- Every placement still lands in `events.jsonl` under that fingerprint, so it's as
+  auditable as anyone else's.
+
+Fingerprints aren't secret, but they do identify you, so mine isn't in this repo.
+It goes in a `docker-compose.override.yml` on the server, which git ignores:
+
+```yaml
+services:
+  sshplace:
+    environment:
+      SSHPLACE_ADMIN_KEYS: "SHA256:your-fingerprint-here"
+```
+
+### Running it yourself: bots
+
+Bots are welcome here. A bot that outpaces every human on the canvas is not.
+
+`-slow-keys` takes comma separated fingerprints and multiplies their cooldown by
+`-slow-factor`, which defaults to 4. They keep playing, at a quarter speed. Nobody
+gets thrown out.
+
+I went looking after the board started feeling automated, and `deploy/detect-bots.py`
+found 28 keys placing every 15.50 seconds with a median deviation of ten
+milliseconds, sustained for four hours, adding up to 66% of all placements. Eleven
+of them shared an active span to the minute with near identical counts, so that is
+one operator running a fleet, not eleven hobbyists.
+
+Worth being precise about what that is and is not:
+
+- **They were not exploiting anything.** One key each, one placement per cooldown,
+  patiently. Every limit was working exactly as designed.
+- **Rate limits cannot separate them from humans.** The two busiest real players
+  measured 172 placements an hour against the bots' 240. Any cooldown long enough
+  to bother a bot ruins the game for your best players.
+- **The global ceiling was irrelevant.** Demand was 1.27/s against a 13.3/s ceiling.
+  Nothing to tighten.
+
+What did distinguish them was precision and duty cycle, and that the keys were
+stable enough to name.
+
+Slowing beats blocking, which is why the default answer here is a longer cooldown:
+
+- It leaves them in the game. Bots drawing on a canvas over SSH is funny, and
+  losing to one is not the same as being spammed by one.
+- It gives them nothing to route around. There is no error to detect, no rejection
+  to handle, just a longer wait. A block announces itself and teaches the operator
+  to rotate keys, and keys are free.
+- The arithmetic is enough. At 4x, a bot goes from 240 placements an hour to 60. The
+  fleet that was 66% of the board becomes about a third of it, and humans go back to
+  being the majority without anyone being banned.
+
+The countdown a slowed key sees is the real one, not the nominal 15 seconds. A
+countdown that lies would just have them pressing a key that keeps being refused.
+
+`-blocked-keys` still exists and refuses a key outright. That is for vandalism, not
+for pacing: someone painting something vile needs stopping, not slowing. Blocked
+keys can still connect and watch, because the canvas is public either way and it is
+the drawing you are taking away.
+
+Precedence is exemption, then block, then slow. A key in `-admin-keys` and
+`-blocked-keys` both is blocked, and the server warns you at boot, because config
+that contradicts itself should fail closed.
+
+Session logs now record the fingerprint alongside the address. They did not before,
+which meant the event log had identities with no address and the session log had
+addresses with no identity, and neither could answer "which network is that placer
+on". That gap is why I still cannot tell you whether those 28 keys were 28 machines
+or one.
+
+The session status bar says `no cooldown` instead of the usual countdown, so you
+can tell at a glance whether it actually applied. A typo'd fingerprint is logged as
+a warning at boot rather than silently granting nothing, because the moment you
+need this is not the moment to discover it never worked.
 
 ## The web view
 
@@ -245,7 +342,10 @@ refuses to connect. I did this to myself while testing. The canvas snapshot and 
 event log are in there too.
 
 Most flags have an env var (`SSHPLACE_SSH_ADDR`, `SSHPLACE_HTTP_ADDR`,
-`SSHPLACE_DATA`, `SSHPLACE_WEB_URL`, `SSHPLACE_MODE`, `SSHPLACE_LOG_LEVEL`).
+`SSHPLACE_DATA`, `SSHPLACE_WEB_URL`, `SSHPLACE_MODE`, `SSHPLACE_LOG_LEVEL`,
+`SSHPLACE_ADMIN_KEYS`,
+`SSHPLACE_BLOCKED_KEYS`,
+`SSHPLACE_SLOW_KEYS`).
 `./sshplace -h` has the rest.
 
 You can resize the board between restarts with `-width` and `-height`. If the saved
@@ -278,7 +378,8 @@ off port forwarding, agent forwarding and pty allocation. If the key ever leaks,
 what an attacker gets is the ability to redeploy your own code from your own repo.
 They cannot get a shell.
 
-Then add four repository secrets under Settings, Secrets and variables, Actions:
+Then add five repository secrets under Settings, Secrets and variables, Actions.
+`DEPLOY_PORT` is the only one you can leave out, and only if sshd is still on 22:
 
 | Secret | Value |
 | --- | --- |
