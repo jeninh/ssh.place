@@ -9,16 +9,18 @@ import (
 	"fmt"
 	"html/template"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 
 	"github.com/jeninh/ssh.place/internal/app"
+	"github.com/jeninh/ssh.place/internal/timelapse"
 )
 
 // Handler returns the HTTP mux for the web view. Nothing it serves can change
 // the canvas; the canvas only moves over SSH.
-func Handler(a *app.App) http.Handler {
-	h := &handler{app: a, png: newPNGCache(a.Canvas), counts: newCountCache(a.Canvas)}
+func Handler(a *app.App, lapses *timelapse.Store) http.Handler {
+	h := &handler{app: a, png: newPNGCache(a.Canvas), counts: newCountCache(a.Canvas), lapses: lapses}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", h.index)
@@ -26,6 +28,8 @@ func Handler(a *app.App) http.Handler {
 	mux.HandleFunc("GET /stats.json", h.statsJSON)
 	mux.HandleFunc("GET /canvas.png", h.canvasPNG)
 	mux.HandleFunc("GET /canvas.txt", h.canvasTXT)
+	mux.HandleFunc("GET /timelapse", h.timelapse)
+	mux.HandleFunc("GET /timelapse/{name}", h.timelapseFile)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		fmt.Fprintln(w, "ok")
@@ -48,6 +52,64 @@ type handler struct {
 	app    *app.App
 	png    *pngCache
 	counts *countCache
+	// lapses may be nil, which just means the timelapse page reports that there
+	// is nothing to show yet.
+	lapses *timelapse.Store
+}
+
+func (h *handler) timelapse(w http.ResponseWriter, _ *http.Request) {
+	h.renderPage(w, timelapseTmpl)
+}
+
+// lapseData fills in the timelapse-only fields.
+func (h *handler) lapseData(d *pageData) {
+	if h.lapses == nil {
+		return
+	}
+	for _, e := range h.lapses.List() {
+		d.Entries = append(d.Entries, lapseView{
+			Name:   e.Name,
+			Label:  e.Label(),
+			Frames: e.Frames,
+			Events: e.Events,
+			MB:     fmt.Sprintf("%.1f", float64(e.Bytes)/(1<<20)),
+		})
+	}
+	if t := h.lapses.Started(); !t.IsZero() {
+		d.Started = t.UTC().Format("2 January 2006, 15:04 UTC")
+	}
+}
+
+// timelapseFile serves a rendered GIF straight off disk.
+//
+// The name is matched against a strict pattern before it is joined to any path,
+// so a request cannot walk out of the timelapse directory however it is spelled.
+func (h *handler) timelapseFile(w http.ResponseWriter, r *http.Request) {
+	if h.lapses == nil {
+		http.NotFound(w, r)
+		return
+	}
+	path, err := h.lapses.Path(r.PathValue("name"))
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil || st.IsDir() {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "image/gif")
+	// A finished day never changes, so let it be cached hard. ServeContent still
+	// handles conditional requests from the modtime.
+	w.Header().Set("Cache-Control", "public, max-age=3600")
+	http.ServeContent(w, r, path, st.ModTime(), f)
 }
 
 // data gathers everything the pages display in one pass.
@@ -84,8 +146,10 @@ func (h *handler) stats(w http.ResponseWriter, _ *http.Request) {
 // renderPage buffers the page before writing it, so a template error can still
 // become a 500 instead of a half-sent page.
 func (h *handler) renderPage(w http.ResponseWriter, t *template.Template) {
+	data := h.data()
+	h.lapseData(&data)
 	var buf bytes.Buffer
-	if err := t.Execute(&buf, h.data()); err != nil {
+	if err := t.Execute(&buf, data); err != nil {
 		http.Error(w, "could not render page", http.StatusInternalServerError)
 		return
 	}

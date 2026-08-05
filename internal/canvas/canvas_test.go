@@ -447,3 +447,141 @@ func TestPaletteIsComplete(t *testing.T) {
 		t.Errorf("ValidColor(%d) = true, want false", PaletteSize)
 	}
 }
+
+func TestSetRegionWritesTheWholeRectangle(t *testing.T) {
+	c := New(20, 10)
+	rect, err := c.SetRegion(3, 2, 6, 4, Block(5))
+	if err != nil {
+		t.Fatalf("SetRegion = %v", err)
+	}
+	if want := 4 * 3; rect.Cells() != want {
+		t.Fatalf("wrote %d cells, want %d", rect.Cells(), want)
+	}
+	if want := (Rect{X0: 3, Y0: 2, X1: 6, Y1: 4}); rect != want {
+		t.Errorf("rect = %+v, want %+v", rect, want)
+	}
+	for y := 0; y < 10; y++ {
+		for x := 0; x < 20; x++ {
+			cell, _ := c.At(x, y)
+			inside := x >= 3 && x <= 6 && y >= 2 && y <= 4
+			if inside && cell.Color != 5 {
+				t.Fatalf("cell %d,%d = %+v, want colour 5", x, y, cell)
+			}
+			if !inside && cell.Drawn() {
+				t.Fatalf("cell %d,%d outside the rectangle was written: %+v", x, y, cell)
+			}
+		}
+	}
+}
+
+func TestSetRegionAcceptsCornersInAnyOrder(t *testing.T) {
+	// An operator drags in whichever direction is convenient, so the corners
+	// arrive in no particular order.
+	corners := [][4]int{{6, 4, 3, 2}, {3, 4, 6, 2}, {6, 2, 3, 4}, {3, 2, 6, 4}}
+	var first []Cell
+	for _, k := range corners {
+		c := New(20, 10)
+		rect, err := c.SetRegion(k[0], k[1], k[2], k[3], Block(7))
+		if err != nil {
+			t.Fatalf("%v: %v", k, err)
+		}
+		if rect.Cells() != 12 {
+			t.Errorf("%v: wrote %d, want 12", k, rect.Cells())
+		}
+		// Whatever order the corners arrive in, the reported rect is normalised, so
+		// the caller that logs the change always describes the same cells.
+		if want := (Rect{X0: 3, Y0: 2, X1: 6, Y1: 4}); rect != want {
+			t.Errorf("%v: rect = %+v, want %+v", k, rect, want)
+		}
+		snap := c.Snapshot()
+		if first == nil {
+			first = snap
+			continue
+		}
+		for i := range snap {
+			if snap[i] != first[i] {
+				t.Fatalf("%v produced a different canvas at index %d", k, i)
+			}
+		}
+	}
+}
+
+func TestSetRegionClipsToTheCanvas(t *testing.T) {
+	c := New(20, 10)
+	// A selection dragged off the edge should clip, not fail.
+	rect, err := c.SetRegion(-5, -5, 4, 4, Block(1))
+	if err != nil {
+		t.Fatalf("SetRegion = %v, want it clipped", err)
+	}
+	if want := 5 * 5; rect.Cells() != want {
+		t.Errorf("wrote %d, want %d", rect.Cells(), want)
+	}
+	// The reported rect must be the clipped one, or a caller logging it would
+	// claim to have written cells that do not exist.
+	if want := (Rect{X0: 0, Y0: 0, X1: 4, Y1: 4}); rect != want {
+		t.Errorf("rect = %+v, want %+v", rect, want)
+	}
+	rect, err = c.SetRegion(18, 8, 999, 999, Block(2))
+	if err != nil {
+		t.Fatalf("SetRegion = %v", err)
+	}
+	if want := 2 * 2; rect.Cells() != want {
+		t.Errorf("wrote %d, want %d", rect.Cells(), want)
+	}
+	if want := (Rect{X0: 18, Y0: 8, X1: 19, Y1: 9}); rect != want {
+		t.Errorf("rect = %+v, want %+v", rect, want)
+	}
+	// Entirely outside is the one case that is an error, because nothing happened.
+	if _, err := c.SetRegion(100, 100, 200, 200, Block(3)); !errors.Is(err, ErrOutOfBounds) {
+		t.Errorf("fully out of bounds = %v, want ErrOutOfBounds", err)
+	}
+}
+
+func TestSetRegionClearsToBlank(t *testing.T) {
+	c := New(20, 10)
+	if _, err := c.SetRegion(0, 0, 19, 9, Block(9)); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.NonEmpty(); got != 200 {
+		t.Fatalf("drawn = %d, want the whole canvas", got)
+	}
+	// Clearing has to leave cells indistinguishable from untouched ones.
+	if _, err := c.SetRegion(2, 2, 5, 5, Glyph(Empty, DefaultColor)); err != nil {
+		t.Fatal(err)
+	}
+	fresh, _ := New(20, 10).At(0, 0)
+	for y := 2; y <= 5; y++ {
+		for x := 2; x <= 5; x++ {
+			cell, _ := c.At(x, y)
+			if cell != fresh {
+				t.Fatalf("cleared cell %d,%d = %+v, want %+v", x, y, cell, fresh)
+			}
+		}
+	}
+	if got, want := c.NonEmpty(), 200-16; got != want {
+		t.Errorf("drawn = %d, want %d", got, want)
+	}
+}
+
+func TestSetRegionRejectsBadCellsAndBumpsVersionOnce(t *testing.T) {
+	c := New(20, 10)
+	if _, err := c.SetRegion(0, 0, 3, 3, Glyph(0x1b, 1)); !errors.Is(err, ErrBadRune) {
+		t.Errorf("escape rune = %v, want ErrBadRune", err)
+	}
+	if _, err := c.SetRegion(0, 0, 3, 3, Glyph('a', PaletteSize)); !errors.Is(err, ErrBadColor) {
+		t.Errorf("bad colour = %v, want ErrBadColor", err)
+	}
+	if c.NonEmpty() != 0 {
+		t.Error("a refused region still wrote to the canvas")
+	}
+
+	// One version bump for the whole rectangle: readers must never see a
+	// half-written region, and the PNG cache keys off this.
+	before := c.Version()
+	if _, err := c.SetRegion(0, 0, 9, 9, Block(4)); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.Version() - before; got != 1 {
+		t.Errorf("version moved %d times for one region, want 1", got)
+	}
+}

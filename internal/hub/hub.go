@@ -26,6 +26,9 @@ var (
 type Update struct {
 	X, Y int
 	Cell canvas.Cell
+	// Resync means "many cells changed, redraw from the canvas". X, Y and Cell
+	// carry nothing in that case, so a receiver must check this first.
+	Resync bool
 }
 
 // Session is one connected client's handle on the hub.
@@ -138,6 +141,27 @@ func (h *Hub) Broadcast(u Update) {
 		default:
 			s.dirty.Store(true)
 			h.dropped.Add(1)
+		}
+	}
+}
+
+// MarkAllDirty flags every session to redraw from the canvas instead of from
+// updates.
+//
+// For a change that touches many cells at once this is both cheaper and more
+// truthful than a burst of individual updates: one pass under the lock, no
+// messages to drop, and every session converges on the canvas as it now is.
+func (h *Hub) MarkAllDirty() {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for _, s := range h.sessions {
+		s.dirty.Store(true)
+		// Nudge the session awake. Its listener is parked on the channel, so
+		// without something to receive it would not notice the flag until the next
+		// placement or tick.
+		select {
+		case s.ch <- Update{Resync: true}:
+		default:
 		}
 	}
 }

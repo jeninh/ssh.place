@@ -24,6 +24,7 @@ import (
 	"github.com/jeninh/ssh.place/internal/hub"
 	"github.com/jeninh/ssh.place/internal/ratelimit"
 	"github.com/jeninh/ssh.place/internal/server"
+	"github.com/jeninh/ssh.place/internal/timelapse"
 	"github.com/jeninh/ssh.place/internal/web"
 )
 
@@ -47,6 +48,10 @@ type config struct {
 	minFill     time.Duration
 	adminKeys   string
 	blockedKeys string
+	requireKey  bool
+	timelapse   bool
+	lapseScale  int
+	lapseFrames int
 	slowKeys    string
 	slowFactor  float64
 	healthcheck string
@@ -80,6 +85,10 @@ func parseFlags() config {
 	flag.StringVar(&c.mode, "mode", envOr("SSHPLACE_MODE", "blocks"), `"blocks" for solid color only, or "mixed" to also allow characters`)
 	flag.StringVar(&c.adminKeys, "admin-keys", envOr("SSHPLACE_ADMIN_KEYS", ""), "comma separated SSH key fingerprints exempt from every rate limit, e.g. SHA256:abc...")
 	flag.StringVar(&c.blockedKeys, "blocked-keys", envOr("SSHPLACE_BLOCKED_KEYS", ""), "comma separated SSH key fingerprints refused at placement time")
+	flag.BoolVar(&c.timelapse, "timelapse", true, "render daily and whole-history timelapse GIFs from the event log and serve them at /timelapse")
+	flag.IntVar(&c.lapseScale, "timelapse-scale", 5, "pixels per cell in rendered timelapses")
+	flag.IntVar(&c.lapseFrames, "timelapse-frames", 300, "frames per rendered timelapse")
+	flag.BoolVar(&c.requireKey, "require-key", true, "only let clients with an SSH public key place; keyless clients can still watch")
 	flag.StringVar(&c.slowKeys, "slow-keys", envOr("SSHPLACE_SLOW_KEYS", ""), "comma separated SSH key fingerprints put on a longer cooldown instead of being blocked")
 	flag.Float64Var(&c.slowFactor, "slow-factor", 4, "multiplier on -cooldown for -slow-keys (1 disables the slowing)")
 	flag.StringVar(&c.logLevel, "log-level", envOr("SSHPLACE_LOG_LEVEL", "info"), "log level: debug, info, warn or error")
@@ -243,6 +252,7 @@ func run(cfg config) error {
 		snapshotPath = filepath.Join(cfg.dataDir, "canvas.json")
 		hostKeyPath  = filepath.Join(cfg.dataDir, "ssh_host_ed25519_key")
 		eventLogPath = filepath.Join(cfg.dataDir, "events.jsonl")
+		lapseDir     = filepath.Join(cfg.dataDir, "timelapse")
 	)
 
 	board, err := canvas.Load(snapshotPath, cfg.width, cfg.height)
@@ -299,7 +309,7 @@ func run(cfg config) error {
 		"max_placements_per_sec", fmt.Sprintf("%.2f", globalRate),
 		"min_board_fill", cfg.minFill, "snapshot", snapshotPath,
 		"admin_keys", len(admins), "blocked_keys", len(blocked),
-		"slow_keys", len(slowed), "slow_cooldown", time.Duration(float64(cfg.cooldown)*cfg.slowFactor))
+		"require_key", cfg.requireKey, "slow_keys", len(slowed), "slow_cooldown", time.Duration(float64(cfg.cooldown)*cfg.slowFactor))
 	a := &app.App{
 		Canvas:     board,
 		Hub:        hub.New(cfg.maxSessions, cfg.maxPerIP),
@@ -309,6 +319,7 @@ func run(cfg config) error {
 		BlocksOnly: blocksOnly,
 		Admins:     admins,
 		Blocked:    blocked,
+		RequireKey: cfg.requireKey,
 		Slowed:     slowed,
 		SlowFactor: cfg.slowFactor,
 	}
@@ -330,11 +341,25 @@ func run(cfg config) error {
 		return err
 	}
 
+	// Timelapses are rendered from the event log, so they are only available when
+	// it is being written.
+	var lapses *timelapse.Store
+	if cfg.eventLog && cfg.timelapse {
+		opt := timelapse.DefaultOptions(cfg.width, cfg.height)
+		opt.Scale = cfg.lapseScale
+		opt.Frames = cfg.lapseFrames
+		lapses = &timelapse.Store{
+			Dir: lapseDir, LogPath: eventLogPath,
+			Width: cfg.width, Height: cfg.height,
+			Opt: opt, Logger: logger,
+		}
+	}
+
 	var httpSrv *http.Server
 	if cfg.httpAddr != "" {
 		httpSrv = &http.Server{
 			Addr:    cfg.httpAddr,
-			Handler: web.Handler(a),
+			Handler: web.Handler(a, lapses),
 			// Every phase gets a bound, so a client that stalls mid-request or
 			// reads a PNG one byte at a time cannot hold a connection open.
 			ReadHeaderTimeout: 10 * time.Second,
@@ -359,6 +384,16 @@ func run(cfg config) error {
 		defer background.Done()
 		pruneLoop(ctx, logger, limiter)
 	}()
+
+	if lapses != nil {
+		background.Add(1)
+		go func() {
+			defer background.Done()
+			// Renders on boot to fill in any day that has no file yet, which is what
+			// makes the history retroactive, then once after every UTC midnight.
+			lapses.Run(ctx)
+		}()
+	}
 
 	serveErr := make(chan error, 2)
 

@@ -13,3 +13,6 @@ coverage.*
 # Per-server settings, including the exempt key fingerprints. Deliberately not
 # committed: the whole point is that it stays on the box.
 docker-compose.override.yml
+
+# Timelapse output. Regenerate with: go run ./cmd/timelapse
+*.gif

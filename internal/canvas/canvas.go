@@ -147,6 +147,63 @@ func (c *Canvas) SetCell(x, y int, cell Cell) error {
 	return nil
 }
 
+// SetRegion writes cell to every position in the rectangle with corners (x0,y0)
+// and (x1,y1), inclusive, and returns how many cells it wrote.
+//
+// The corners may be given in any order, and the rectangle is clipped to the
+// canvas rather than refused, so a caller can hand over a selection that runs
+// off an edge.
+//
+// The lock is taken once and the version counter moves once, which is the whole
+// reason this exists: the same work through SetCell would lock and bump twelve
+// thousand times for a full-canvas wipe, and every reader would see a different
+// intermediate state.
+//
+// The returned Rect is what was actually written, after clipping. Callers that
+// need to describe the change, to a log or to other sessions, must use it rather
+// than re-deriving the clip themselves: two copies of that arithmetic is two
+// chances for the record to disagree with the canvas.
+func (c *Canvas) SetRegion(x0, y0, x1, y1 int, cell Cell) (Rect, error) {
+	if err := cell.Validate(); err != nil {
+		return Rect{}, err
+	}
+	if x0 > x1 {
+		x0, x1 = x1, x0
+	}
+	if y0 > y1 {
+		y0, y1 = y1, y0
+	}
+	x0, y0 = max(x0, 0), max(y0, 0)
+	x1, y1 = min(x1, c.w-1), min(y1, c.h-1)
+	if x0 > x1 || y0 > y1 {
+		return Rect{}, ErrOutOfBounds
+	}
+
+	c.mu.Lock()
+	for y := y0; y <= y1; y++ {
+		row := c.cells[y*c.w+x0 : y*c.w+x1+1]
+		for i := range row {
+			row[i] = cell
+		}
+	}
+	c.mu.Unlock()
+	c.version.Add(1)
+	return Rect{X0: x0, Y0: y0, X1: x1, Y1: y1}, nil
+}
+
+// Rect is an inclusive rectangle of cell positions.
+type Rect struct {
+	X0, Y0, X1, Y1 int
+}
+
+// Cells is how many positions the rectangle covers.
+func (r Rect) Cells() int {
+	if r.X1 < r.X0 || r.Y1 < r.Y0 {
+		return 0
+	}
+	return (r.X1 - r.X0 + 1) * (r.Y1 - r.Y0 + 1)
+}
+
 // Set writes a character cell. It is shorthand for SetCell with a Glyph.
 func (c *Canvas) Set(x, y int, r rune, col uint8) error {
 	return c.SetCell(x, y, Glyph(r, col))

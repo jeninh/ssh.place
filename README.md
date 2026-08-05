@@ -122,9 +122,19 @@ seconds.
 ### Identity
 
 Any public key works and there's nothing to register. Its SHA256 fingerprint is who
-you are. Connect with no key at all and you fall back to keyboard-interactive, which
-means you get identified by network instead and share that budget with anyone else
-on it.
+you are.
+
+Connect with no key at all and you can watch but not draw. You still get the live
+canvas, panning and all, you just cannot place. A keyless client falls back to
+keyboard-interactive and is identified by its network, which is the weakest identity
+here: it is shared with everyone behind the same address, so a cooldown against it is
+really a cooldown against a whole building. I did not start there. I turned it on
+after measuring 3,335 sessions in three hours from three addresses, every one of them
+keyless, connecting for two seconds each to place a cell and drop.
+
+The session says so on arrival and tells you the one command that fixes it, because
+most people arriving without a key have done nothing wrong. Run it with
+`-require-key=false` if you would rather let keyless clients draw on your own copy.
 
 ### Limits
 
@@ -137,9 +147,11 @@ on it.
 | Concurrent sessions | 500 | `-max-sessions` |
 | Sessions per network | 5 | `-max-per-ip` |
 | Idle disconnect | 30 min | `-idle-timeout` |
+| Public key required to place | yes | `-require-key` |
 | Keys exempt from all of it | none | `-admin-keys` |
 | Keys on a longer cooldown | none | `-slow-keys`, `-slow-factor` |
 | Keys refused outright | none | `-blocked-keys` |
+| Daily timelapse GIFs | on | `-timelapse`, `-timelapse-scale`, `-timelapse-frames` |
 | Unauthenticated connection | 20s | fixed |
 | Accepted connections | 4 x `-max-sessions` | fixed |
 
@@ -271,10 +283,66 @@ addresses with no identity, and neither could answer "which network is that plac
 on". That gap is why I still cannot tell you whether those 28 keys were 28 machines
 or one.
 
+An exempt session also gets the two keys that only make sense for moderating:
+
+| Key | What it does |
+| --- | --- |
+| `` ` `` | eraser on and off. Placing clears the cell instead of colouring it |
+| `v` | start a rectangular selection. Move to the far corner, then `enter` |
+
+The selection pins one corner where you pressed `v` and marks it `o`; your cursor is
+the other corner, and the status bar counts the size as you move. `enter` applies it,
+`esc` cancels. With the eraser on it wipes the rectangle back to blank; with it off
+it fills the rectangle in your current colour, which is the better answer when you
+want to cover something rather than leave a hole.
+
+That is enforced in `app.PlaceRegion`, not in the view, because it is the one bulk
+write in the codebase. A missing check there would let one keystroke flatten the
+board. It also respects the block list: a fingerprint in `-admin-keys` and
+`-blocked-keys` at once is blocked, so the bulk path is not a way around a block.
+
+Every wiped cell goes into the event log individually, which matters more than it
+looks: the log is the only record of how the canvas got where it is, and the
+timelapse replays it to reproduce the canvas exactly. A bulk change that skipped the
+log would desync every later frame.
+
 The session status bar says `no cooldown` instead of the usual countdown, so you
 can tell at a glance whether it actually applied. A typo'd fingerprint is logged as
 a warning at boot rather than silently granting nothing, because the moment you
 need this is not the moment to discover it never worked.
+
+## Timelapses
+
+Every placement since the first one is in an append-only log, so a timelapse is just
+that log replayed onto a blank canvas. The server renders two kinds a couple of
+minutes after each UTC midnight and serves them at
+[/timelapse](https://ssh.place/timelapse): one per day, and one covering everything
+since the beginning.
+
+It backfills. Point it at a log with history in it and the first boot renders every
+complete day it can find, so turning this on did not cost the days that had already
+happened.
+
+Frames are spaced evenly over placements rather than over the clock. Spacing them by
+time would spend most of the animation on whichever hours everyone was asleep. A
+single day is seeded with the state the canvas opened on that morning rather than
+starting empty, so it shows that day's changes in context.
+
+GIF is a natural fit: the canvas is already sixteen palette colours, which is exactly
+what the format stores, so nothing is quantised and there is no video encoder in the
+picture. The caption row uses the same bitmap font as the PNG endpoint, so there are
+still no font files to ship.
+
+Rendering deliberately never happens on a request. Every frame is held in memory at
+once, so serving one on demand would let anyone with a browser decide when the server
+allocates a hundred megabytes.
+
+For a one-off at a different size, or from a log copied off the box:
+
+```sh
+go run ./cmd/timelapse -in data/events.jsonl -out all.gif
+go run ./cmd/timelapse -in data/events.jsonl -day 2026-08-03 -out day.gif
+```
 
 ## The web view
 
@@ -285,6 +353,7 @@ need this is not the moment to discover it never worked.
 | `/stats` | who's on, how full the board is, which colors are winning |
 | `/canvas.png` | 1400x780 PNG, for screenshots and timelapses |
 | `/stats.json` | the same numbers but json |
+| `/timelapse` | every rendered timelapse, newest first |
 | `/canvas.txt` | plain text, blocks as `█` |
 | `/healthz` | `ok` |
 

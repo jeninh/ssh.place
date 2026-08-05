@@ -46,6 +46,10 @@ func bgOfFill(fill uint8) uint8 { return bgPaletteBase + fill&0x0f }
 // rather than blanking it.
 const cursorGlyph = 'x'
 
+// anchorGlyph marks the fixed corner of a rectangular selection. Distinct from
+// the cursor so it is obvious which end moves.
+const anchorGlyph = 'o'
+
 // Contrast colors for the cursor marker: white on dark cells, black on light
 // ones.
 const (

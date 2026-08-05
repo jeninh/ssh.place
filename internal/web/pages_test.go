@@ -10,7 +10,7 @@ import (
 )
 
 func TestIndexUsesTheDarkPaletteOnly(t *testing.T) {
-	body := get(t, Handler(newApp(t)), "/").Body.String()
+	body := get(t, Handler(newApp(t), nil), "/").Body.String()
 
 	if !strings.Contains(body, "--bg: #0d1117") {
 		t.Error("page is missing the dark background")
@@ -22,7 +22,7 @@ func TestIndexUsesTheDarkPaletteOnly(t *testing.T) {
 }
 
 func TestFooterLinksOnEveryPage(t *testing.T) {
-	h := Handler(newApp(t))
+	h := Handler(newApp(t), nil)
 	for _, path := range []string{"/", "/stats"} {
 		body := get(t, h, path).Body.String()
 
@@ -63,7 +63,7 @@ func TestStatsPageRendersFigures(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rec := get(t, Handler(a), "/stats")
+	rec := get(t, Handler(a, nil), "/stats")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
@@ -95,7 +95,7 @@ func TestStatsPageRendersFigures(t *testing.T) {
 }
 
 func TestStatsPageWithAnEmptyCanvas(t *testing.T) {
-	body := get(t, Handler(newApp(t)), "/stats").Body.String()
+	body := get(t, Handler(newApp(t), nil), "/stats").Body.String()
 	if !strings.Contains(body, "Nothing has been drawn yet") {
 		t.Error("an empty canvas should say so rather than show an empty table")
 	}
@@ -112,7 +112,7 @@ func TestStatsJSONReportsBlocksAndColors(t *testing.T) {
 		}
 	}
 
-	rec := get(t, Handler(a), "/stats.json")
+	rec := get(t, Handler(a, nil), "/stats.json")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
@@ -198,7 +198,7 @@ func TestCanvasTXTStillServesBlocks(t *testing.T) {
 	if err := a.Canvas.Fill(0, 0, 5); err != nil {
 		t.Fatal(err)
 	}
-	rec := get(t, Handler(a), "/canvas.txt")
+	rec := get(t, Handler(a, nil), "/canvas.txt")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
@@ -210,7 +210,7 @@ func TestCanvasTXTStillServesBlocks(t *testing.T) {
 // Only the exact root serves the landing page; anything else is a 404 rather
 // than a copy of the index.
 func TestOnlyExactRootServesTheIndex(t *testing.T) {
-	h := Handler(newApp(t))
+	h := Handler(newApp(t), nil)
 	for _, path := range []string{"/nope", "/stats/extra", "/canvas"} {
 		if rec := get(t, h, path); rec.Code != http.StatusNotFound {
 			t.Errorf("GET %s = %d, want 404", path, rec.Code)

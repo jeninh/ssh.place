@@ -157,6 +157,33 @@ func (h *harness) help() string {
 	return lines[len(lines)-1]
 }
 
+// newHarnessKeyless builds a session with no public key on a canvas that
+// requires one, which is the combination that produces the notice.
+func newHarnessKeyless(t *testing.T) *harness {
+	t.Helper()
+	a := &app.App{
+		Canvas:     canvas.New(40, 12),
+		Hub:        hub.New(100, 10),
+		Limiter:    ratelimit.New(testCooldown, 1_000_000, time.Nanosecond),
+		RequireKey: true,
+		BlocksOnly: true,
+	}
+	sess, err := a.Hub.Add("1.1.1.1", "ip:1.1.1.1", false)
+	if err != nil {
+		t.Fatalf("add session: %v", err)
+	}
+	t.Cleanup(func() { a.Hub.Remove(sess) })
+	clk := &clock{t: base}
+	exit := &Exit{}
+	m := New(Config{
+		App: a, Session: sess, Renderer: newRenderer(termenv.Ascii),
+		IdleTimeout: 30 * time.Minute, Exit: exit, Now: clk.now,
+		BlocksOnly: true, RequireKey: true,
+	})
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	return &harness{model: m, app: a, sess: sess, clock: clk, exit: exit}
+}
+
 func runes(rs ...rune) tea.KeyMsg {
 	return tea.KeyMsg{Type: tea.KeyRunes, Runes: rs}
 }
@@ -1004,5 +1031,308 @@ func TestAdminStatusBarShowsNoCooldown(t *testing.T) {
 	}
 	if left := h.model.cooldownLeft(h.clock.now()); left != 0 {
 		t.Errorf("cooldownLeft = %s, want 0", left)
+	}
+}
+
+func TestEraserIsOperatorOnly(t *testing.T) {
+	h := newHarness(t)
+
+	h.press(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'`'}})
+	h.flush()
+	if h.model.erase {
+		t.Error("backtick enabled the eraser for a non-operator")
+	}
+	if !strings.Contains(h.status(), "does nothing") {
+		t.Errorf("status = %q, want it to say the key does nothing", h.status())
+	}
+}
+
+func TestEraserClearsACell(t *testing.T) {
+	h := newHarness(t, func(c *Config) {
+		c.App.Admins = map[string]bool{"key-a": true}
+	})
+
+	// Paint something first, so there is genuinely something to remove.
+	h.press(special(tea.KeyEnter))
+	h.flush()
+	x, y := h.model.curX, h.model.curY
+	if cell, ok := h.model.app.Canvas.At(x, y); !ok || !cell.Drawn() {
+		t.Fatalf("precondition: cell %d,%d not drawn", x, y)
+	}
+
+	h.press(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'`'}})
+	h.flush()
+	if !h.model.erase {
+		t.Fatal("backtick did not enable the eraser for an operator")
+	}
+	if got := h.model.stampLabel(); got != "erase" {
+		t.Errorf("stampLabel = %q, want %q", got, "erase")
+	}
+
+	h.press(special(tea.KeyEnter))
+	h.flush()
+	cell, ok := h.model.app.Canvas.At(x, y)
+	if !ok {
+		t.Fatal("cell vanished from the canvas")
+	}
+	if cell.Drawn() {
+		t.Errorf("cell = %+v, want it cleared", cell)
+	}
+	if cell.IsBlock() {
+		t.Error("cleared cell still has a fill, so it is not truly blank")
+	}
+
+	// And back off again.
+	h.press(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'`'}})
+	h.flush()
+	if h.model.erase {
+		t.Error("backtick did not toggle the eraser back off")
+	}
+}
+
+func TestEraseSurvivesASnapshotAsBlank(t *testing.T) {
+	// The point of clearing with no fill rather than painting a dark colour: it
+	// has to be indistinguishable from a cell nobody ever touched.
+	h := newHarness(t, func(c *Config) {
+		c.App.Admins = map[string]bool{"key-a": true}
+	})
+	x, y := h.model.curX, h.model.curY
+	untouched, _ := h.model.app.Canvas.At(x+1, y)
+
+	h.press(special(tea.KeyEnter))
+	h.flush()
+	h.press(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'`'}})
+	h.flush()
+	h.press(special(tea.KeyEnter))
+	h.flush()
+
+	cleared, _ := h.model.app.Canvas.At(x, y)
+	if cleared != untouched {
+		t.Errorf("cleared cell = %+v, untouched cell = %+v, want identical", cleared, untouched)
+	}
+}
+
+func TestKeylessSeesTheNoticeThenTheCanvas(t *testing.T) {
+	h := newHarnessKeyless(t)
+
+	if !strings.Contains(stripANSI(h.frame()), "You are watching") {
+		t.Fatalf("first frame did not show the notice:\n%s", stripANSI(h.frame()))
+	}
+	// The command that fixes it is the one part that must always be present.
+	if !strings.Contains(stripANSI(h.frame()), "ssh-keygen -t ed25519") {
+		t.Error("notice omitted the ssh-keygen command")
+	}
+
+	// Any key dismisses, and must not also act as a command.
+	before := h.model.curX
+	h.press(special(tea.KeyRight))
+	if h.model.curX != before {
+		t.Error("the dismissing keypress also moved the cursor, want it swallowed")
+	}
+	if strings.Contains(stripANSI(h.frame()), "You are watching") {
+		t.Error("notice still showing after a keypress")
+	}
+	if !strings.Contains(h.status(), "watching") {
+		t.Errorf("status = %q, want it to keep saying watching", h.status())
+	}
+}
+
+func TestKeylessCannotPlace(t *testing.T) {
+	h := newHarnessKeyless(t)
+	h.press(runes('x')) // dismiss
+	x, y := h.model.curX, h.model.curY
+
+	h.press(special(tea.KeyEnter))
+	if cell, ok := h.app.Canvas.At(x, y); ok && cell.Drawn() {
+		t.Errorf("keyless session placed a cell: %+v", cell)
+	}
+	if !strings.Contains(h.status(), "watching only") {
+		t.Errorf("status = %q, want it to explain the refusal", h.status())
+	}
+	// Waiting must not help, because this is not a cooldown.
+	h.clock.advance(time.Hour)
+	h.press(special(tea.KeyEnter))
+	if cell, ok := h.app.Canvas.At(x, y); ok && cell.Drawn() {
+		t.Error("keyless session placed after waiting, want it still refused")
+	}
+}
+
+func TestKeylessCanStillWatchAndMove(t *testing.T) {
+	// Watch-only has to mean genuinely watching: panning, and seeing other
+	// people's placements arrive.
+	h := newHarnessKeyless(t)
+	h.press(runes('x'))
+
+	x0 := h.model.curX
+	h.press(special(tea.KeyRight))
+	if h.model.curX != x0+1 {
+		t.Error("keyless session could not move the cursor")
+	}
+
+	// A placement from someone else must still show up.
+	other, err := h.app.Hub.Add("9.9.9.9", "SHA256:someone", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.app.Hub.Remove(other)
+	if _, err := h.app.Place(other, 3, 3, canvas.Block(1), h.clock.now()); err != nil {
+		t.Fatalf("keyed session Place = %v, want nil", err)
+	}
+	h.send(canvasMsg(hub.Update{X: 3, Y: 3, Cell: canvas.Block(1)}))
+	h.flush()
+	if cell, ok := h.app.Canvas.At(3, 3); !ok || !cell.Drawn() {
+		t.Error("the other session's placement did not land")
+	}
+}
+
+func TestKeyedSessionSeesNoNotice(t *testing.T) {
+	h := newHarness(t, func(c *Config) { c.RequireKey = true })
+	if strings.Contains(stripANSI(h.frame()), "You are watching") {
+		t.Error("a keyed session was shown the keyless notice")
+	}
+	if h.model.watching {
+		t.Error("a keyed session was marked watch-only")
+	}
+}
+
+// adminHarness is a session whose key is exempt, so operator keys work.
+func adminHarness(t *testing.T) *harness {
+	t.Helper()
+	return newHarness(t, func(c *Config) {
+		c.App.Admins = map[string]bool{"key-a": true}
+	})
+}
+
+// paintAll fills the whole test canvas so a wipe has something to remove.
+func paintAll(t *testing.T, h *harness, color uint8) {
+	t.Helper()
+	w, hh := h.app.Canvas.Size()
+	if _, err := h.app.Canvas.SetRegion(0, 0, w-1, hh-1, canvas.Block(color)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRegionWipesOnlyBetweenTheTwoCorners(t *testing.T) {
+	h := adminHarness(t)
+	paintAll(t, h, 9)
+
+	// Put the cursor on a known corner, mark it, then move to the other one.
+	h.model.curX, h.model.curY = 4, 2
+	h.press(runes('v'))
+	if !h.model.region {
+		t.Fatal("v did not start a selection")
+	}
+	h.press(runes('`')) // eraser on, so the region clears rather than fills
+	for i := 0; i < 5; i++ {
+		h.press(runes('l')) // right
+	}
+	for i := 0; i < 3; i++ {
+		h.press(runes('j')) // down
+	}
+	if gotW, gotH := h.model.regionSize(); gotW != 6 || gotH != 4 {
+		t.Fatalf("selection = %dx%d, want 6x4", gotW, gotH)
+	}
+	if !strings.Contains(h.status(), "select 6x4") {
+		t.Errorf("status = %q, want it to show the selection size", h.status())
+	}
+
+	h.press(special(tea.KeyEnter))
+	if h.model.region {
+		t.Error("selection still open after committing")
+	}
+
+	// Exactly the rectangle from (4,2) to (9,5) is blank, and nothing else.
+	w, hh := h.app.Canvas.Size()
+	for y := 0; y < hh; y++ {
+		for x := 0; x < w; x++ {
+			cell, _ := h.app.Canvas.At(x, y)
+			inside := x >= 4 && x <= 9 && y >= 2 && y <= 5
+			if inside && cell.Drawn() {
+				t.Fatalf("cell %d,%d inside the selection survived: %+v", x, y, cell)
+			}
+			if !inside && !cell.Drawn() {
+				t.Fatalf("cell %d,%d outside the selection was wiped", x, y)
+			}
+		}
+	}
+}
+
+func TestRegionWorksDraggingUpAndLeft(t *testing.T) {
+	// The anchor can end up as any corner, so dragging back towards the origin has
+	// to behave the same.
+	h := adminHarness(t)
+	paintAll(t, h, 9)
+	h.model.curX, h.model.curY = 8, 6
+	h.press(runes('v'))
+	h.press(runes('`'))
+	for i := 0; i < 3; i++ {
+		h.press(runes('h')) // left
+	}
+	for i := 0; i < 2; i++ {
+		h.press(runes('k')) // up
+	}
+	h.press(special(tea.KeyEnter))
+
+	for y := 4; y <= 6; y++ {
+		for x := 5; x <= 8; x++ {
+			if cell, _ := h.app.Canvas.At(x, y); cell.Drawn() {
+				t.Fatalf("cell %d,%d should have been wiped: %+v", x, y, cell)
+			}
+		}
+	}
+	if cell, _ := h.app.Canvas.At(4, 4); !cell.Drawn() {
+		t.Error("cell just outside the selection was wiped")
+	}
+}
+
+func TestRegionCanFillInsteadOfWipe(t *testing.T) {
+	// Same selection, eraser off: it paints instead. One mechanism, both uses.
+	h := adminHarness(t)
+	h.model.curX, h.model.curY = 1, 1
+	h.press(runes('v'))
+	h.press(runes('3')) // pick a colour
+	h.press(runes('l'))
+	h.press(runes('j'))
+	h.press(special(tea.KeyEnter))
+
+	for y := 1; y <= 2; y++ {
+		for x := 1; x <= 2; x++ {
+			cell, _ := h.app.Canvas.At(x, y)
+			if !cell.IsBlock() || cell.Color != 3 {
+				t.Fatalf("cell %d,%d = %+v, want a colour 3 block", x, y, cell)
+			}
+		}
+	}
+}
+
+func TestRegionCanBeCancelled(t *testing.T) {
+	h := adminHarness(t)
+	paintAll(t, h, 9)
+	h.model.curX, h.model.curY = 3, 3
+	h.press(runes('v'))
+	h.press(runes('l'))
+
+	for _, key := range []tea.KeyMsg{special(tea.KeyEsc), runes('v')} {
+		h.model.region, h.model.regionX, h.model.regionY = true, 3, 3
+		h.press(key)
+		if h.model.region {
+			t.Errorf("%v did not cancel the selection", key)
+		}
+	}
+	// Nothing was wiped by cancelling.
+	if cell, _ := h.app.Canvas.At(3, 3); !cell.Drawn() {
+		t.Error("cancelling still wiped a cell")
+	}
+}
+
+func TestRegionIsOperatorOnly(t *testing.T) {
+	h := newHarness(t) // not an operator
+	paintAll(t, h, 9)
+	h.press(runes('v'))
+	if h.model.region {
+		t.Fatal("a non-operator started a selection")
+	}
+	if !strings.Contains(h.status(), "does nothing") {
+		t.Errorf("status = %q, want it to say the key does nothing", h.status())
 	}
 }

@@ -850,3 +850,216 @@ func TestAdminBeatsSlowing(t *testing.T) {
 		}
 	}
 }
+
+func TestKeylessSessionsCannotPlaceWhenAKeyIsRequired(t *testing.T) {
+	f := newFixture(t, func(f *fixture) { f.app.RequireKey = true })
+	keyless, err := f.app.Hub.Add("1.1.1.1", "ip:1.1.1.1", false)
+	if err != nil {
+		t.Fatalf("add session: %v", err)
+	}
+	t.Cleanup(func() { f.app.Hub.Remove(keyless) })
+
+	retry, err := f.app.Place(keyless, 1, 1, canvas.Block(3), base)
+	if !errors.Is(err, ErrKeyRequired) {
+		t.Fatalf("Place = %v, want ErrKeyRequired", err)
+	}
+	// Not a cooldown, so offering a wait would be misleading.
+	if retry != 0 {
+		t.Errorf("retryAfter = %s, want 0", retry)
+	}
+	if cell, ok := f.app.Canvas.At(1, 1); ok && cell.Drawn() {
+		t.Error("keyless placement reached the canvas")
+	}
+	// It also must not burn the network budget, or a keyless client could still
+	// starve the keyed sessions sharing its address.
+	keyed := f.session(t, "1.1.1.1", "SHA256:realkey")
+	if _, err := f.app.Place(keyed, 2, 2, canvas.Block(3), base); err != nil {
+		t.Errorf("keyed Place from the same network = %v, want nil", err)
+	}
+}
+
+func TestKeylessStillWorksWhenNoKeyIsRequired(t *testing.T) {
+	// The default for anyone running their own copy must stay permissive unless
+	// they opt in, so this is the switch being off.
+	f := newFixture(t)
+	keyless, err := f.app.Hub.Add("1.1.1.1", "ip:1.1.1.1", false)
+	if err != nil {
+		t.Fatalf("add session: %v", err)
+	}
+	t.Cleanup(func() { f.app.Hub.Remove(keyless) })
+
+	if _, err := f.app.Place(keyless, 1, 1, canvas.Block(3), base); err != nil {
+		t.Errorf("Place = %v, want nil", err)
+	}
+}
+
+func TestPlaceRegionIsOperatorOnly(t *testing.T) {
+	f := newFixture(t, withAdmin(adminKey), withEventLog(t))
+	stranger := f.session(t, "2.2.2.2", "SHA256:notyou")
+
+	if _, err := f.app.PlaceRegion(stranger, 0, 0, 9, 5, canvas.Block(4), base); !errors.Is(err, ErrNotOperator) {
+		t.Fatalf("PlaceRegion = %v, want ErrNotOperator", err)
+	}
+	if f.app.Canvas.NonEmpty() != 0 {
+		t.Error("a refused region reached the canvas")
+	}
+}
+
+func TestPlaceRegionWritesLogsAndBroadcasts(t *testing.T) {
+	f := newFixture(t, withAdmin(adminKey), withEventLog(t))
+	admin := f.session(t, "1.1.1.1", adminKey)
+	watcher := f.session(t, "2.2.2.2", "SHA256:watcher")
+
+	n, err := f.app.PlaceRegion(admin, 2, 1, 5, 3, canvas.Block(6), base)
+	if err != nil {
+		t.Fatalf("PlaceRegion = %v", err)
+	}
+	if want := 4 * 3; n != want {
+		t.Fatalf("wrote %d, want %d", n, want)
+	}
+	if got := f.app.Canvas.NonEmpty(); got != n {
+		t.Errorf("canvas has %d drawn, want %d", got, n)
+	}
+
+	// Every cell must reach the event log, or the timelapse replay stops matching
+	// the canvas from this point on.
+	if err := f.app.Log.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	events := readEvents(t, f.events)
+	if len(events) != n {
+		t.Errorf("logged %d events, want %d", len(events), n)
+	}
+	for _, e := range events {
+		if e.Identity != adminKey {
+			t.Errorf("event identity = %q, want the operator's fingerprint", e.Identity)
+		}
+	}
+
+	// The watcher sees it, though the hub is free to drop and flag a resync.
+	got := len(drain(watcher))
+	if got == 0 && !watcher.TakeDirty() {
+		t.Error("watcher got neither updates nor a dirty flag")
+	}
+}
+
+func TestPlaceRegionClearsWithoutLeavingAFill(t *testing.T) {
+	f := newFixture(t, withAdmin(adminKey), withEventLog(t))
+	admin := f.session(t, "1.1.1.1", adminKey)
+
+	if _, err := f.app.PlaceRegion(admin, 0, 0, 39, 9, canvas.Block(9), base); err != nil {
+		t.Fatal(err)
+	}
+	// Now wipe a rectangle out of the middle of it.
+	if _, err := f.app.PlaceRegion(admin, 10, 3, 19, 6, canvas.Glyph(canvas.Empty, 0), base); err != nil {
+		t.Fatalf("clearing region = %v", err)
+	}
+	for y := 3; y <= 6; y++ {
+		for x := 10; x <= 19; x++ {
+			cell, _ := f.app.Canvas.At(x, y)
+			if cell.Drawn() || cell.IsBlock() {
+				t.Fatalf("cell %d,%d = %+v, want truly blank", x, y, cell)
+			}
+		}
+	}
+	// And the surroundings are untouched.
+	if cell, _ := f.app.Canvas.At(9, 3); cell.Color != 9 {
+		t.Errorf("cell just outside the wipe = %+v, want colour 9", cell)
+	}
+}
+
+func TestPlaceRegionStillRefusesCharactersInBlocksOnly(t *testing.T) {
+	f := newFixture(t, withAdmin(adminKey), withEventLog(t), blocksOnly)
+	admin := f.session(t, "1.1.1.1", adminKey)
+
+	if _, err := f.app.PlaceRegion(admin, 0, 0, 5, 5, canvas.Glyph('A', 1), base); !errors.Is(err, ErrCharactersDisabled) {
+		t.Errorf("PlaceRegion with a character = %v, want ErrCharactersDisabled", err)
+	}
+	// An erase carries no character, so it stays legal.
+	if _, err := f.app.PlaceRegion(admin, 0, 0, 5, 5, canvas.Glyph(canvas.Empty, 0), base); err != nil {
+		t.Errorf("clearing region in blocks-only = %v, want nil", err)
+	}
+}
+
+func TestPlaceRegionIsNotRateLimited(t *testing.T) {
+	// The point of the exemption: an operator cleaning up cannot be doing it one
+	// cell per cooldown.
+	f := newFixture(t, withAdmin(adminKey), withEventLog(t), withTightLimits)
+	admin := f.session(t, "1.1.1.1", adminKey)
+
+	for i := 0; i < 4; i++ {
+		if _, err := f.app.PlaceRegion(admin, 0, i, 39, i, canvas.Block(uint8(i+1)), base); err != nil {
+			t.Fatalf("region %d = %v, want nil", i, err)
+		}
+	}
+}
+
+func TestPlaceRegionRespectsTheBlockList(t *testing.T) {
+	// The bulk path must not be a way around a block. Precedence is the same as
+	// Place: a fingerprint in both lists is blocked, not exempt.
+	f := newFixture(t, withAdmin(adminKey), withBlocked(adminKey), withEventLog(t))
+	s := f.session(t, "1.1.1.1", adminKey)
+
+	if _, err := f.app.PlaceRegion(s, 0, 0, 9, 5, canvas.Block(4), base); !errors.Is(err, ErrKeyBlocked) {
+		t.Fatalf("PlaceRegion = %v, want ErrKeyBlocked", err)
+	}
+	if f.app.Canvas.NonEmpty() != 0 {
+		t.Error("a blocked operator still wrote a region")
+	}
+}
+
+func TestPlaceRegionLogsExactlyWhatItWrote(t *testing.T) {
+	// A selection dragged off the edge is clipped, and the log has to describe the
+	// clipped rectangle. If it claimed the requested one, replaying the log would
+	// stop reproducing the canvas.
+	f := newFixture(t, withAdmin(adminKey), withEventLog(t))
+	admin := f.session(t, "1.1.1.1", adminKey)
+
+	n, err := f.app.PlaceRegion(admin, -10, -10, 3, 2, canvas.Block(7), base)
+	if err != nil {
+		t.Fatalf("PlaceRegion = %v", err)
+	}
+	if want := 4 * 3; n != want {
+		t.Fatalf("wrote %d, want %d", n, want)
+	}
+	if err := f.app.Log.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	events := readEvents(t, f.events)
+	if len(events) != n {
+		t.Fatalf("logged %d events, want %d", len(events), n)
+	}
+	for _, e := range events {
+		if e.X < 0 || e.Y < 0 || e.X > 3 || e.Y > 2 {
+			t.Errorf("logged a cell outside the clipped rectangle: %d,%d", e.X, e.Y)
+		}
+	}
+}
+
+func TestPlaceRegionMarksSessionsForResync(t *testing.T) {
+	// One flag beats n updates for a bulk change: nothing to drop, and every
+	// session converges on the canvas as it now is.
+	f := newFixture(t, withAdmin(adminKey), withEventLog(t))
+	admin := f.session(t, "1.1.1.1", adminKey)
+	watcher := f.session(t, "2.2.2.2", "SHA256:watcher")
+
+	if _, err := f.app.PlaceRegion(admin, 0, 0, 39, 9, canvas.Block(2), base); err != nil {
+		t.Fatal(err)
+	}
+	if !watcher.TakeDirty() {
+		t.Error("watcher was not flagged to resync")
+	}
+	// It also gets a nudge, so its listener wakes up rather than waiting for the
+	// next placement or tick.
+	updates := drain(watcher)
+	if len(updates) == 0 {
+		t.Fatal("watcher got no wake-up at all")
+	}
+	if !updates[0].Resync {
+		t.Errorf("first update = %+v, want a resync marker", updates[0])
+	}
+	// A full-canvas wipe must not have queued a message per cell.
+	if len(updates) > 4 {
+		t.Errorf("got %d updates for one region, want a handful", len(updates))
+	}
+}

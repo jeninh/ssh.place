@@ -38,7 +38,7 @@ func get(t *testing.T, h http.Handler, path string, headers ...[2]string) *httpt
 
 func TestIndexServesThePage(t *testing.T) {
 	a := newApp(t)
-	rec := get(t, Handler(a), "/")
+	rec := get(t, Handler(a, nil), "/")
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
@@ -55,7 +55,7 @@ func TestIndexServesThePage(t *testing.T) {
 }
 
 func TestUnknownPathIs404(t *testing.T) {
-	if rec := get(t, Handler(newApp(t)), "/nope"); rec.Code != http.StatusNotFound {
+	if rec := get(t, Handler(newApp(t), nil), "/nope"); rec.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want 404", rec.Code)
 	}
 }
@@ -66,7 +66,7 @@ func TestCanvasPNGDecodesAtTheRightSize(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rec := get(t, Handler(a), "/canvas.png")
+	rec := get(t, Handler(a, nil), "/canvas.png")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
@@ -156,7 +156,7 @@ func TestPNGCacheTracksCanvasVersion(t *testing.T) {
 
 func TestCanvasPNGETagRevalidation(t *testing.T) {
 	a := newApp(t)
-	h := Handler(a)
+	h := Handler(a, nil)
 
 	first := get(t, h, "/canvas.png")
 	etag := first.Header().Get("ETag")
@@ -194,7 +194,7 @@ func TestCanvasTXT(t *testing.T) {
 		}
 	}
 
-	rec := get(t, Handler(a), "/canvas.txt")
+	rec := get(t, Handler(a, nil), "/canvas.txt")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
@@ -217,7 +217,7 @@ func TestCanvasTXTDoesNotMutateCanvas(t *testing.T) {
 	if err := a.Canvas.Set(0, 0, 'a', 1); err != nil {
 		t.Fatal(err)
 	}
-	h := Handler(a)
+	h := Handler(a, nil)
 	get(t, h, "/canvas.txt")
 
 	rows := a.Canvas.Text()
@@ -240,7 +240,7 @@ func TestStatsJSON(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rec := get(t, Handler(a), "/stats.json")
+	rec := get(t, Handler(a, nil), "/stats.json")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
@@ -270,7 +270,7 @@ func TestStatsJSON(t *testing.T) {
 }
 
 func TestHealthz(t *testing.T) {
-	rec := get(t, Handler(newApp(t)), "/healthz")
+	rec := get(t, Handler(newApp(t), nil), "/healthz")
 	if rec.Code != http.StatusOK {
 		t.Errorf("status = %d, want 200", rec.Code)
 	}
@@ -281,7 +281,7 @@ func TestHealthz(t *testing.T) {
 
 // The web view is read-only: nothing here may accept a write.
 func TestWritesAreRejected(t *testing.T) {
-	h := Handler(newApp(t))
+	h := Handler(newApp(t), nil)
 	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodPatch} {
 		for _, path := range []string{"/", "/canvas.png", "/stats.json"} {
 			req := httptest.NewRequest(method, path, strings.NewReader("x=1"))

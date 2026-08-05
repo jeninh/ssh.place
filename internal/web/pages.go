@@ -99,6 +99,7 @@ const layout = `<!doctype html>
 <footer>
   <a href="/">canvas</a> ·
   <a href="/stats">stats</a> ·
+  <a href="/timelapse">timelapse</a> ·
   <a href="/canvas.png">png</a> ·
   <a href="` + repoURL + `">open source</a>
 </footer>
@@ -264,6 +265,20 @@ type pageData struct {
 	Cooldown       int
 	BlocksOnly     bool
 	Colors         []colorStat
+
+	// Timelapse page only.
+	Entries []lapseView
+	Started string
+}
+
+// lapseView is one timelapse as the page needs it, with sizes already formatted
+// so the template stays free of arithmetic.
+type lapseView struct {
+	Name   string
+	Label  string
+	Frames int
+	Events int
+	MB     string
 }
 
 func pct(n, total int) string {
@@ -303,3 +318,50 @@ func colorStats(counts [canvas.PaletteSize]int, drawn int) []colorStat {
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Count > out[j].Count })
 	return out
 }
+
+var timelapseTmpl = page("timelapse", `
+{{define "title"}}ssh.place timelapses{{end}}
+{{define "description"}}Every day of the ssh.place canvas, as an animated GIF{{end}}
+{{define "body"}}
+<header>
+  <h1>ssh<span class="dot">.</span>place</h1>
+  <p class="tagline"><b>Timelapses</b></p>
+  <p class="sub">
+    {{if .Started}}First pixel {{.Started}} · {{end}}rebuilt after every UTC midnight
+  </p>
+</header>
+
+{{if .Entries}}
+{{range .Entries}}
+<h2>{{.Label}}</h2>
+<figure>
+  <a href="/timelapse/{{.Name}}"><img class="canvas" src="/timelapse/{{.Name}}"
+     alt="Timelapse of the ssh.place canvas: {{.Label}}" loading="lazy"></a>
+  <figcaption>
+    {{if .Events}}{{.Events}} placements · {{end}}{{.Frames}} frames · {{.MB}} MB ·
+    <a href="/timelapse/{{.Name}}">download</a>
+  </figcaption>
+</figure>
+{{end}}
+{{else}}
+<p class="alt">
+  No timelapses yet. The first one is written a couple of minutes after the next
+  UTC midnight, once there is a full day to show.
+</p>
+{{end}}
+
+<h2>How they are made</h2>
+<p>
+  Every placement since the first one is in an append-only log, so a timelapse is
+  just that log replayed onto a blank canvas. Frames are spaced evenly over
+  placements rather than over the clock, because spacing them by time would spend
+  most of the animation on whichever hours everyone was asleep.
+</p>
+<p>
+  A single day starts from the state the canvas opened on that morning rather than
+  from empty, so it shows that day's changes in context. GIF is a natural fit
+  here: the canvas is already sixteen palette colours, which is exactly what the
+  format stores, so nothing is quantised and there is no video encoder involved.
+</p>
+{{end}}
+`)

@@ -28,6 +28,15 @@ var ErrCharactersDisabled = errors.New("blocks only, no characters")
 // matters: one means wait your turn, the other means somebody nearby is hogging.
 var ErrNetworkBusy = errors.New("your network has used its share, hold on")
 
+// ErrKeyRequired is returned when a session with no public key tries to place
+// on a canvas that requires one.
+//
+// A keyless client is identified by network, which is the weakest identity here:
+// it is shared by everyone behind the same address, so a cooldown against it is
+// really a cooldown against a whole building. Every abusive session measured on
+// the live canvas was keyless for exactly that reason.
+var ErrKeyRequired = errors.New("no key, so watching only")
+
 // ErrKeyBlocked is returned when the key has been blocked by the operator. It
 // carries no retryAfter because there is nothing to wait for.
 var ErrKeyBlocked = errors.New("this key is blocked from placing on ssh.place")
@@ -55,6 +64,10 @@ type App struct {
 	// rather than one cell every fifteen seconds. Read only from server config,
 	// never from anything the client sends.
 	Admins map[string]bool
+
+	// RequireKey makes a public key mandatory for placing. Keyless clients can
+	// still connect and watch.
+	RequireKey bool
 
 	// Blocked holds SSH key fingerprints refused at placement time. Read only
 	// from server config. Blocked keys can still connect and watch: the canvas is
@@ -144,6 +157,13 @@ func (a *App) Place(s *hub.Session, x, y int, cell canvas.Cell, now time.Time) (
 		return 0, ErrCharactersDisabled
 	}
 
+	// Before the limiter, because this is about who they are rather than how fast
+	// they are going, and a keyless client should not be told to wait for a turn
+	// it is never going to get.
+	if a.RequireKey && !s.Keyed {
+		return 0, ErrKeyRequired
+	}
+
 	// Checked before the exemption, so a fingerprint appearing in both lists is
 	// blocked rather than exempt. Config that contradicts itself should fail
 	// closed.
@@ -188,6 +208,82 @@ func (a *App) Place(s *hub.Session, x, y int, cell canvas.Cell, now time.Time) (
 	a.placements.Add(1)
 	a.Hub.Broadcast(hub.Update{X: x, Y: y, Cell: cell})
 	return 0, nil
+}
+
+// ErrNotOperator is returned when a session asks for something only an operator
+// may do.
+var ErrNotOperator = errors.New("that is an operator action")
+
+// PlaceRegion writes cell across a whole rectangle on behalf of s.
+//
+// Operators only, and checked here rather than in the TUI: this is a bulk write,
+// so it is the one place in this file where a missing check would let one
+// keystroke flatten the canvas.
+//
+// It is exempt from the limiters for the same reason the per-key exemption
+// exists. Moderating at one cell every fifteen seconds is not moderating, and
+// clearing a region is the thing you need when somebody has drawn something
+// vile at three in the morning.
+func (a *App) PlaceRegion(s *hub.Session, x0, y0, x1, y1 int, cell canvas.Cell, now time.Time) (int, error) {
+	if !a.IsAdmin(s) {
+		return 0, ErrNotOperator
+	}
+	// Same precedence as Place: a fingerprint in both lists is blocked, not
+	// exempt. Without this the bulk path would be a way around the block list,
+	// which is the one thing an exemption must never buy.
+	if a.IsBlocked(s) {
+		return 0, ErrKeyBlocked
+	}
+	if err := cell.Validate(); err != nil {
+		return 0, err
+	}
+	// A block and an erase both carry no character, so both stay legal.
+	if a.BlocksOnly && cell.Rune != canvas.Empty {
+		return 0, ErrCharactersDisabled
+	}
+
+	// SetRegion reports the rectangle it actually wrote, so the log and the
+	// broadcast describe the change rather than the request.
+	rect, err := a.Canvas.SetRegion(x0, y0, x1, y1, cell)
+	if err != nil {
+		return 0, err
+	}
+	n := rect.Cells()
+
+	for y := rect.Y0; y <= rect.Y1; y++ {
+		for x := rect.X0; x <= rect.X1; x++ {
+			// Every cell is logged individually. The event log is the only record of
+			// how the canvas got to where it is, and the timelapse replays it to
+			// reproduce the canvas exactly; a bulk change that skipped the log would
+			// break that and every later frame would be wrong.
+			if err := a.Log.Append(eventlog.Event{
+				At:       now.UTC(),
+				Identity: s.Identity,
+				X:        x,
+				Y:        y,
+				Rune:     string(cell.Rune),
+				Color:    cell.Color,
+				Block:    cell.IsBlock(),
+			}); err != nil && a.Logger != nil {
+				a.Logger.Error("append event log", "err", err)
+			}
+		}
+	}
+
+	// One flag rather than n updates. Sending a cell at a time would take the hub
+	// lock once per cell and push twelve thousand messages at every session for a
+	// full-canvas wipe, which stalls the operator's own session doing it. Sessions
+	// redraw from the canvas when they see this, which is the same path a client
+	// that fell behind already takes.
+	a.Hub.MarkAllDirty()
+	a.placements.Add(uint64(n))
+
+	if a.Logger != nil {
+		a.Logger.Info("region written", "by", s.Identity,
+			"x0", rect.X0, "y0", rect.Y0, "x1", rect.X1, "y1", rect.Y1,
+			"cells", n, "cleared", !cell.Drawn())
+	}
+	return n, nil
 }
 
 // CooldownLeft reports how long s must wait before its next placement.

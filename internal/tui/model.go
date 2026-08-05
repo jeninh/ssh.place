@@ -78,6 +78,9 @@ type Config struct {
 	// BlocksOnly hides character mode entirely. It must match the App's own
 	// setting, which is what actually enforces it.
 	BlocksOnly bool
+	// RequireKey mirrors the App setting so the view can explain the restriction.
+	// The App is what enforces it.
+	RequireKey bool
 	// Exit receives the reason the session ended.
 	Exit *Exit
 	// Now defaults to time.Now; tests override it.
@@ -116,6 +119,23 @@ type Model struct {
 	// would normally be a command. Without it the movement, color and quit keys
 	// would be undrawable.
 	literalNext bool
+
+	// erase makes placements clear the cell instead of colouring it. Operators
+	// only, toggled with backtick. Nothing here enforces that: the key handler
+	// checks, and the server does not need to, because a blank cell is a legal
+	// placement for anyone and always has been.
+	erase bool
+
+	// region holds the anchor corner of a rectangular selection, when one is in
+	// progress. The cursor is the opposite corner. Operators only.
+	region  bool
+	regionX int
+	regionY int
+	// watching means this session cannot place, only look. Set for a keyless
+	// client on a canvas that requires a key.
+	watching bool
+	// splash holds the one-time notice shown before the canvas. Any key clears it.
+	splash bool
 
 	cooldownUntil time.Time
 	lastInput     time.Time
@@ -171,9 +191,13 @@ func New(cfg Config) *Model {
 		// out of it.
 		block:      true,
 		blocksOnly: cfg.BlocksOnly,
+		watching:   cfg.RequireKey && cfg.Session != nil && !cfg.Session.Keyed,
 		lastInput:  now,
 		recent:     make(map[int]time.Time),
 	}
+	// Explain up front rather than letting them press keys at a canvas that will
+	// not respond and work it out themselves.
+	m.splash = m.watching
 	// An identity that placed just before reconnecting is still cooling down;
 	// show that rather than a misleading "ready".
 	if left := m.app.CooldownLeft(m.sess, now); left > 0 {
@@ -215,12 +239,24 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.repaint(now, true)
 
 	case tea.KeyMsg:
+		if m.splash {
+			// Any key dismisses, and is swallowed: the first keystroke is an
+			// acknowledgement, not a command.
+			m.splash = false
+			m.lastInput = now
+			return m, m.repaint(now, true)
+		}
 		return m, m.handleKey(msg, now)
 
 	case tea.MouseMsg:
 		return m, m.handleMouse(msg, now)
 
 	case canvasMsg:
+		if msg.Resync {
+			// A bulk change carries no coordinates, so there is no cell to mark as
+			// recently placed. Redraw everything instead of trusting the fade map.
+			return m, tea.Batch(m.repaint(now, true), waitForUpdate(m.sess.Updates()))
+		}
 		m.recent[m.idx(msg.X, msg.Y)] = now
 		return m, tea.Batch(m.repaint(now, false), waitForUpdate(m.sess.Updates()))
 
@@ -460,6 +496,37 @@ func (m *Model) handleOneKey(msg tea.KeyMsg, now time.Time) tea.Cmd {
 	case "shift+tab":
 		m.color = (m.color + canvas.PaletteSize - 1) % canvas.PaletteSize
 
+	// Backtick is the eraser, and it is only offered to an operator. Everyone
+	// else placing blanks would just be a faster way to wreck other people's
+	// work, whereas clearing a region is the one moderation move that cannot be
+	// done with a colour.
+	// v for a visual selection, which is what vim calls it and where an operator
+	// will reach first.
+	case "v":
+		if !m.app.IsAdmin(m.sess) {
+			m.setFlash("that key does nothing here", now)
+			break
+		}
+		if m.region {
+			m.region = false
+			m.setFlash("selection cancelled", now)
+			break
+		}
+		m.region, m.regionX, m.regionY = true, m.curX, m.curY
+		m.setFlash("corner set, move and press enter", now)
+
+	case "`":
+		if !m.app.IsAdmin(m.sess) {
+			m.setFlash("that key does nothing here", now)
+			break
+		}
+		m.erase = !m.erase
+		if m.erase {
+			m.setFlash("eraser on, placing clears the cell", now)
+		} else {
+			m.setFlash("eraser off", now)
+		}
+
 	case `\`:
 		if m.blocksOnly {
 			m.setFlash(blocksOnlyMsg, now)
@@ -482,6 +549,11 @@ func (m *Model) handleOneKey(msg tea.KeyMsg, now time.Time) tea.Cmd {
 		}
 
 	case "esc":
+		if m.region {
+			m.region = false
+			m.setFlash("selection cancelled", now)
+			break
+		}
 		// Nothing to cancel; clear any lingering message.
 		m.flash, m.flashUntil = "", time.Time{}
 
@@ -518,8 +590,44 @@ func stampRune(msg tea.KeyMsg) (rune, bool) {
 	return 0, false
 }
 
+// commitRegion applies the current stamp across the selected rectangle.
+//
+// Whether that clears or paints is just the eraser toggle, so the one selection
+// mechanism covers both wiping a region and blocking one out in a colour.
+func (m *Model) commitRegion(now time.Time) {
+	n, err := m.app.PlaceRegion(m.sess, m.regionX, m.regionY, m.curX, m.curY, m.cell(), now)
+	m.region = false
+	if err != nil {
+		m.setFlash(err.Error(), now)
+		return
+	}
+	what := "filled"
+	if m.erase {
+		what = "cleared"
+	}
+	m.setFlash(fmt.Sprintf("%s %d cells", what, n), now)
+}
+
+// regionSize is the rectangle the selection currently covers.
+func (m *Model) regionSize() (w, h int) {
+	return abs(m.curX-m.regionX) + 1, abs(m.curY-m.regionY) + 1
+}
+
+func abs(n int) int {
+	if n < 0 {
+		return -n
+	}
+	return n
+}
+
 // cell is what this session would place right now.
 func (m *Model) cell() canvas.Cell {
+	if m.erase {
+		// A blank cell carries no character and no fill, which is exactly what an
+		// undrawn cell looks like, so this genuinely resets rather than painting
+		// something that merely looks like the background.
+		return canvas.Glyph(canvas.Empty, m.color)
+	}
 	if m.block || m.blocksOnly {
 		return canvas.Block(m.color)
 	}
@@ -527,6 +635,10 @@ func (m *Model) cell() canvas.Cell {
 }
 
 func (m *Model) place(now time.Time) {
+	if m.region {
+		m.commitRegion(now)
+		return
+	}
 	retryAfter, err := m.app.Place(m.sess, m.curX, m.curY, m.cell(), now)
 	switch {
 	case err == nil:
@@ -575,6 +687,11 @@ func (m *Model) render(now time.Time) {
 	if m.termW < minTermW || m.termH < minTermH {
 		m.frame = fmt.Sprintf("ssh.place needs at least %dx%d. Your terminal is %dx%d.",
 			minTermW, minTermH, m.termW, m.termH)
+		return
+	}
+
+	if m.splash {
+		m.frame = m.keylessSplash()
 		return
 	}
 
@@ -661,6 +778,19 @@ func (m *Model) styleFor(x, y int, cell canvas.Cell, now time.Time, hasRecent bo
 		return styleKey{fg: borderColor, bg: bgNone}, g
 	}
 
+	// The anchor corner gets the same treatment as the cursor, so an operator can
+	// see both ends of the rectangle they are about to write over.
+	if m.region && x == m.regionX && y == m.regionY && !(x == m.curX && y == m.curY) {
+		k := m.keyFor(x, y, cell, now, hasRecent)
+		if cell.IsBlock() {
+			k.fg = cursorFg(k.bg)
+			k.decor = decorBold
+			return k, anchorGlyph
+		}
+		k.decor = decorReverse
+		return k, m.glyphFor(cell)
+	}
+
 	k := m.keyFor(x, y, cell, now, hasRecent)
 	if k.decor != decorNone {
 		// On a solid block the foreground and fill are the same color, so reverse
@@ -722,10 +852,21 @@ func (m *Model) statusBar(now time.Time, width int) string {
 	segs := []segment{
 		{text: "ssh.place", style: m.styles.logo},
 		{text: fmt.Sprintf("%d,%d", m.curX, m.curY), style: m.styles.coords},
-		{text: m.stampLabel(), style: m.styles.swatch(m.color)},
+		{text: m.stampLabel(), style: m.stampStyle()},
+	}
+
+	if m.region {
+		w, h := m.regionSize()
+		segs = append(segs, segment{
+			text:  fmt.Sprintf("select %dx%d", w, h),
+			style: m.styles.eraser,
+		})
 	}
 
 	switch {
+	case m.watching:
+		// Not "ready", and not a countdown either: neither would be true.
+		segs = append(segs, segment{text: "watching", style: m.styles.cooling})
 	case m.app.IsAdmin(m.sess):
 		// Worth saying out loud rather than showing a permanent "ready": if the
 		// exemption ever stops applying, you find out from the status bar instead
@@ -755,8 +896,21 @@ func (m *Model) statusBar(now time.Time, width int) string {
 // still fits in the status bar of an 80-column terminal.
 const blocksOnlyMsg = "blocks only, no characters"
 
+// stampStyle colours the stamp segment. The eraser gets its own look rather
+// than a swatch, because a swatch showing a colour it will not place is worse
+// than no swatch at all.
+func (m *Model) stampStyle() lipgloss.Style {
+	if m.erase {
+		return m.styles.eraser
+	}
+	return m.styles.swatch(m.color)
+}
+
 // stampLabel describes what the next placement will put down.
 func (m *Model) stampLabel() string {
+	if m.erase {
+		return "erase"
+	}
 	if m.block || m.blocksOnly {
 		return fmt.Sprintf("███ %s", canvas.Palette[m.color].Name)
 	}
@@ -781,6 +935,18 @@ func (m *Model) cooldownLeft(now time.Time) time.Duration {
 func (m *Model) helpBar(width int) string {
 	if m.literalNext {
 		return m.styles.literal.Render(fit(`\ pressed: the next key becomes your stamp`, width))
+	}
+	if m.region {
+		w, h := m.regionSize()
+		verb := "fill"
+		if m.erase {
+			verb = "clear"
+		}
+		return m.styles.literal.Render(fit(fmt.Sprintf(
+			"selecting %dx%d · move to size it · enter to %s · esc to cancel", w, h, verb), width))
+	}
+	if m.erase {
+		return m.styles.literal.Render(fit("eraser on · place to clear a cell · ` to go back to colour", width))
 	}
 	// Each mode advertises only what is useful in it, which is what keeps the
 	// line inside 80 columns without dropping a binding.

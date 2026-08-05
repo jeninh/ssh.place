@@ -212,6 +212,7 @@ func (s *Server) teaHandler(sess ssh.Session) (tea.Model, []tea.ProgramOption) {
 		IdleTimeout: s.cfg.IdleTimeout,
 		WebURL:      s.cfg.WebURL,
 		BlocksOnly:  s.cfg.BlocksOnly,
+		RequireKey:  s.cfg.App.RequireKey,
 		Exit:        exit,
 	})
 	// Mouse reporting lets the wheel pan the canvas and a click move the cursor.
@@ -227,10 +228,11 @@ func (s *Server) logConnections(next ssh.Handler) ssh.Handler {
 		// The fingerprint goes in the log because the event log records identities
 		// with no address and this log recorded addresses with no identity, so
 		// neither could answer "which network is that placer on".
-		identity, keyed := "-", false
-		if hs, ok := sess.Context().Value(ctxKeySession).(*hub.Session); ok && hs != nil {
-			identity, keyed = hs.Identity, hs.Keyed
-		}
+		//
+		// Derived from the session rather than read out of the context: this
+		// middleware is the outermost one, so the hub session is not in the context
+		// yet and looking for it there logged "-" for every connection.
+		identity, keyed := identityOf(sess, ip)
 		s.log.Info("session start", "ip", ip, "identity", identity, "keyed", keyed,
 			"client", sess.Context().ClientVersion())
 		next(sess)
