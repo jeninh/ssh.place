@@ -155,5 +155,15 @@ func TestTimelapseIsLinkedFromEveryPage(t *testing.T) {
 		if !strings.Contains(rec.Body.String(), `href="/timelapse"`) {
 			t.Errorf("%s does not link to the timelapse page", path)
 		}
+		// The footer is the only navigation the site has, so every link in it is
+		// worth pinning: a typo in one is invisible until someone clicks it.
+		for _, link := range []string{
+			`href="/"`, `href="/stats"`, `href="/canvas.png"`,
+			"github.com/jeninh/ssh.place", "reddit.com/r/sshplace",
+		} {
+			if !strings.Contains(rec.Body.String(), link) {
+				t.Errorf("%s footer is missing %q", path, link)
+			}
+		}
 	}
 }

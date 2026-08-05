@@ -11,6 +11,9 @@ import (
 // repoURL is where the source lives; it is linked from every page footer.
 const repoURL = "https://github.com/jeninh/ssh.place"
 
+// redditURL is the community, also linked from every footer.
+const redditURL = "https://www.reddit.com/r/sshplace/"
+
 // style is the shared stylesheet. It follows the same system as openotp.app —
 // GitHub's typography, spacing and borders — but pinned to the dark palette
 // rather than following the viewer's system preference, so the page always
@@ -101,7 +104,8 @@ const layout = `<!doctype html>
   <a href="/stats">stats</a> ·
   <a href="/timelapse">timelapse</a> ·
   <a href="/canvas.png">png</a> ·
-  <a href="` + repoURL + `">open source</a>
+  <a href="` + repoURL + `">open source</a> ·
+  <a href="` + redditURL + `">r/sshplace</a>
 </footer>
 </body>
 </html>

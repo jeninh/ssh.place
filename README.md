@@ -12,6 +12,8 @@
 <p align="center">
   <a href="https://ssh.place">Live canvas</a> ·
   <a href="https://ssh.place/stats">Stats</a> ·
+  <a href="https://ssh.place/timelapse">Timelapses</a> ·
+  <a href="https://www.reddit.com/r/sshplace/">r/sshplace</a> ·
   <a href="#running-your-own">Run your own</a> <br>
 </p>
 
