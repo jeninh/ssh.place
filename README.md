@@ -159,6 +159,8 @@ most people arriving without a key have done nothing wrong. Run it with
 | Keys exempt from all of it | none | `-admin-keys` |
 | Keys on a longer cooldown | none | `-slow-keys`, `-slow-factor` |
 | Keys refused outright | none | `-blocked-keys` |
+| Networks on a longer cooldown | none | `-slow-nets` |
+| Networks refused outright | none | `-blocked-nets` |
 | Daily timelapse GIFs | on | `-timelapse`, `-timelapse-scale`, `-timelapse-frames` |
 | Unauthenticated connection | 20s | fixed |
 | Accepted connections | 4 x `-max-sessions` | fixed |
@@ -275,6 +277,37 @@ Slowing beats blocking, which is why the default answer here is a longer cooldow
 
 The countdown a slowed key sees is the real one, not the nominal 15 seconds. A
 countdown that lies would just have them pressing a key that keeps being refused.
+
+### When keys stop being enough
+
+Someone wrote a domain name across the canvas seven times, in white and magenta,
+top to bottom. I went looking for the keys behind it and found **2,642 of them for
+6,173 placements**. About two placements per key. They were generating a fresh
+keypair almost every time they drew a cell.
+
+That is the moment a fingerprint list stops being a tool. You cannot enumerate
+something that is regenerated per placement, and every entry you add is already
+stale. But all 6,173 came from **six networks**, so `-blocked-nets` and `-slow-nets`
+take CIDR blocks instead:
+
+```
+-blocked-nets 115.190.40.0/24,129.151.214.0/24
+-slow-nets    83.175.139.0/24
+```
+
+Six lines instead of 2,642, and unlike a key a subnet cannot be reissued on a whim.
+That is the whole reason this works: keys are free and networks are not.
+
+Reverse DNS before you write one down. Of those six, three resolved to hosting
+(Hetzner, Oracle Cloud, and one with no PTR at all) and two did not: a Polish ISP
+that might be somebody's house, and `igw.nyi.freebsd.org`, which is the FreeBSD
+project's own network. A `/24` ban takes everyone behind it, so hosting ranges get
+`-blocked-nets` and anything that might be a real person's connection gets
+`-slow-nets`, where the worst case is that a human draws four times slower rather
+than not at all.
+
+A blocked network beats an exempt key, deliberately. An operator key sitting inside
+a banned range must not be a way back in.
 
 `-blocked-keys` still exists and refuses a key outright. That is for vandalism, not
 for pacing: someone painting something vile needs stopping, not slowing. Blocked

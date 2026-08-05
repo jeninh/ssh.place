@@ -14,6 +14,7 @@ import (
 	"github.com/jeninh/ssh.place/internal/canvas"
 	"github.com/jeninh/ssh.place/internal/eventlog"
 	"github.com/jeninh/ssh.place/internal/hub"
+	"github.com/jeninh/ssh.place/internal/netset"
 	"github.com/jeninh/ssh.place/internal/ratelimit"
 )
 
@@ -1061,5 +1062,99 @@ func TestPlaceRegionMarksSessionsForResync(t *testing.T) {
 	// A full-canvas wipe must not have queued a message per cell.
 	if len(updates) > 4 {
 		t.Errorf("got %d updates for one region, want a handful", len(updates))
+	}
+}
+
+func withBlockedNets(list string) func(*fixture) {
+	return func(f *fixture) { f.app.BlockedNets = netset.MustParse(list) }
+}
+
+func TestBlockedNetworkCannotPlace(t *testing.T) {
+	// The six /24s measured drawing watchgoose.com across the whole canvas.
+	f := newFixture(t, withBlockedNets("115.190.40.0/24,210.22.150.0/24"))
+
+	// A fresh key every time, which is exactly what they do: 2,642 keys for
+	// 6,173 placements. The network is what has to hold.
+	for i, ip := range []string{"115.190.40.10", "115.190.40.200", "210.22.150.146"} {
+		s := f.session(t, ip, fmt.Sprintf("SHA256:rotated-%d", i))
+		retry, err := f.app.Place(s, i, 0, canvas.Block(13), base)
+		if !errors.Is(err, ErrNetworkBlocked) {
+			t.Fatalf("%s: Place = %v, want ErrNetworkBlocked", ip, err)
+		}
+		if retry != 0 {
+			t.Errorf("%s: retryAfter = %s, want 0", ip, retry)
+		}
+	}
+	if f.app.Canvas.NonEmpty() != 0 {
+		t.Error("a blocked network still wrote to the canvas")
+	}
+}
+
+func TestBlockedNetworkLeavesNeighboursAlone(t *testing.T) {
+	f := newFixture(t, withBlockedNets("115.190.40.0/24"))
+	// One digit different in the third octet, and a legitimate player.
+	ok := f.session(t, "115.190.41.10", "SHA256:realperson")
+	if _, err := f.app.Place(ok, 1, 1, canvas.Block(2), base); err != nil {
+		t.Errorf("Place from an adjacent network = %v, want nil", err)
+	}
+}
+
+func TestNetworkBlockBeatsTheExemption(t *testing.T) {
+	// An exempt key sitting inside a banned range must not be a way back in.
+	f := newFixture(t, withAdmin(adminKey), withBlockedNets("115.190.40.0/24"))
+	s := f.session(t, "115.190.40.10", adminKey)
+
+	if _, err := f.app.Place(s, 0, 0, canvas.Block(1), base); !errors.Is(err, ErrNetworkBlocked) {
+		t.Errorf("Place = %v, want ErrNetworkBlocked", err)
+	}
+	if _, err := f.app.PlaceRegion(s, 0, 0, 5, 5, canvas.Block(1), base); !errors.Is(err, ErrNetworkBlocked) {
+		t.Errorf("PlaceRegion = %v, want ErrNetworkBlocked", err)
+	}
+}
+
+func TestBlockedNetworkRefusalCostsNoBudget(t *testing.T) {
+	// A refused network must not be able to drain the budget of the people it
+	// shares a limiter with.
+	f := newFixture(t, withBlockedNets("115.190.40.0/24"), withIPBudget(2, time.Hour))
+	bot := f.session(t, "115.190.40.10", "SHA256:bot")
+	for i := 0; i < 10; i++ {
+		if _, err := f.app.Place(bot, i, 0, canvas.Block(1), base); !errors.Is(err, ErrNetworkBlocked) {
+			t.Fatalf("Place = %v, want ErrNetworkBlocked", err)
+		}
+	}
+	human := f.session(t, "9.9.9.9", "SHA256:human")
+	if _, err := f.app.Place(human, 0, 5, canvas.Block(2), base); err != nil {
+		t.Errorf("human Place = %v, want nil", err)
+	}
+}
+
+func TestSlowedNetworkGetsTheLongerCooldown(t *testing.T) {
+	// The gentler option for a range that might be mixed: still playing, slower.
+	f := newFixture(t, func(f *fixture) {
+		f.app.SlowedNets = netset.MustParse("203.0.113.0/24")
+		f.app.SlowFactor = 4
+	})
+	s := f.session(t, "203.0.113.9", "SHA256:whoever")
+
+	if _, err := f.app.Place(s, 0, 0, canvas.Block(1), base); err != nil {
+		t.Fatalf("first Place = %v, want nil", err)
+	}
+	if _, err := f.app.Place(s, 1, 0, canvas.Block(1), base.Add(testCooldown)); !errors.Is(err, ErrCooldown) {
+		t.Errorf("Place at the normal cooldown = %v, want ErrCooldown", err)
+	}
+	if _, err := f.app.Place(s, 1, 0, canvas.Block(1), base.Add(4*testCooldown)); err != nil {
+		t.Errorf("Place at 4x = %v, want nil", err)
+	}
+}
+
+func TestNoNetworksConfiguredChangesNothing(t *testing.T) {
+	// Nil sets must be inert, or forgetting the flag would block the world.
+	f := newFixture(t)
+	if f.app.IsNetBlocked(f.session(t, "115.190.40.10", "SHA256:x")) {
+		t.Error("IsNetBlocked = true with no networks configured")
+	}
+	s := f.session(t, "115.190.40.11", "SHA256:y")
+	if _, err := f.app.Place(s, 0, 0, canvas.Block(1), base); err != nil {
+		t.Errorf("Place = %v, want nil", err)
 	}
 }

@@ -12,6 +12,7 @@ import (
 	"github.com/jeninh/ssh.place/internal/canvas"
 	"github.com/jeninh/ssh.place/internal/eventlog"
 	"github.com/jeninh/ssh.place/internal/hub"
+	"github.com/jeninh/ssh.place/internal/netset"
 	"github.com/jeninh/ssh.place/internal/ratelimit"
 )
 
@@ -40,6 +41,12 @@ var ErrKeyRequired = errors.New("no key, so watching only")
 // ErrKeyBlocked is returned when the key has been blocked by the operator. It
 // carries no retryAfter because there is nothing to wait for.
 var ErrKeyBlocked = errors.New("this key is blocked from placing on ssh.place")
+
+// ErrNetworkBlocked is returned when the client's network has been blocked.
+//
+// Separate from ErrKeyBlocked because it is a different fact about a different
+// thing, and because the operator wants to see which one fired in the logs.
+var ErrNetworkBlocked = errors.New("this network is blocked from placing on ssh.place")
 
 // ErrCanvasBusy is returned when the canvas as a whole has hit its churn
 // ceiling, which is the limit that stops it being repainted end to end.
@@ -85,6 +92,21 @@ type App struct {
 	// are free.
 	Slowed map[string]bool
 
+	// BlockedNets refuses whole networks. This is the only lever that survives
+	// key rotation: 6,173 placements were measured coming from 2,642 distinct
+	// keys, about two each, so a fingerprint list is chasing something that is
+	// regenerated per placement. A subnet costs money and cannot be reissued on a
+	// whim.
+	//
+	// It is blunt on purpose. Everyone behind a blocked network loses the ability
+	// to place, so it belongs on hosting ranges running fleets, not on a range
+	// that might be somebody's home.
+	BlockedNets *netset.Set
+
+	// SlowedNets puts whole networks on the longer cooldown instead of refusing
+	// them, for a range that is probably mixed.
+	SlowedNets *netset.Set
+
 	// SlowFactor multiplies the cooldown for a slowed key. Zero or one means no
 	// slowing at all, which makes an unset factor safe rather than silently
 	// punitive.
@@ -118,12 +140,21 @@ func (a *App) IsBlocked(s *hub.Session) bool {
 	return a.Blocked[s.Identity]
 }
 
-// IsSlowed reports whether s has been put on a longer cooldown.
+// IsNetBlocked reports whether s connected from a blocked network.
+func (a *App) IsNetBlocked(s *hub.Session) bool {
+	return s != nil && a.BlockedNets.Contains(s.IP)
+}
+
+// IsSlowed reports whether s has been put on a longer cooldown, by key or by
+// network.
 func (a *App) IsSlowed(s *hub.Session) bool {
-	if s == nil || len(a.Slowed) == 0 || a.SlowFactor <= 1 {
+	if s == nil || a.SlowFactor <= 1 {
 		return false
 	}
-	return a.Slowed[s.Identity]
+	if a.SlowedNets.Contains(s.IP) {
+		return true
+	}
+	return len(a.Slowed) > 0 && a.Slowed[s.Identity]
 }
 
 // cooldownFor returns the cooldown that applies to s.
@@ -169,6 +200,12 @@ func (a *App) Place(s *hub.Session, x, y int, cell canvas.Cell, now time.Time) (
 	// closed.
 	if a.IsBlocked(s) {
 		return 0, ErrKeyBlocked
+	}
+	// After the key check so a blocked key still reports as a blocked key, and
+	// before the exemption so a network ban is not something an exempt key can
+	// sit inside.
+	if a.IsNetBlocked(s) {
+		return 0, ErrNetworkBlocked
 	}
 
 	// Admins skip all three limits. Every placement still goes through the same
@@ -233,6 +270,9 @@ func (a *App) PlaceRegion(s *hub.Session, x0, y0, x1, y1 int, cell canvas.Cell, 
 	// which is the one thing an exemption must never buy.
 	if a.IsBlocked(s) {
 		return 0, ErrKeyBlocked
+	}
+	if a.IsNetBlocked(s) {
+		return 0, ErrNetworkBlocked
 	}
 	if err := cell.Validate(); err != nil {
 		return 0, err

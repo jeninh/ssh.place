@@ -22,6 +22,7 @@ import (
 	"github.com/jeninh/ssh.place/internal/canvas"
 	"github.com/jeninh/ssh.place/internal/eventlog"
 	"github.com/jeninh/ssh.place/internal/hub"
+	"github.com/jeninh/ssh.place/internal/netset"
 	"github.com/jeninh/ssh.place/internal/ratelimit"
 	"github.com/jeninh/ssh.place/internal/server"
 	"github.com/jeninh/ssh.place/internal/timelapse"
@@ -54,6 +55,8 @@ type config struct {
 	lapseScale  int
 	lapseFrames int
 	slowKeys    string
+	blockedNets string
+	slowNets    string
 	slowFactor  float64
 	healthcheck string
 }
@@ -91,6 +94,8 @@ func parseFlags() config {
 	flag.IntVar(&c.lapseScale, "timelapse-scale", 5, "pixels per cell in rendered timelapses")
 	flag.IntVar(&c.lapseFrames, "timelapse-frames", 300, "frames per rendered timelapse")
 	flag.BoolVar(&c.requireKey, "require-key", true, "only let clients with an SSH public key place; keyless clients can still watch")
+	flag.StringVar(&c.blockedNets, "blocked-nets", envOr("SSHPLACE_BLOCKED_NETS", ""), "comma separated CIDR blocks refused at placement time, e.g. 203.0.113.0/24")
+	flag.StringVar(&c.slowNets, "slow-nets", envOr("SSHPLACE_SLOW_NETS", ""), "comma separated CIDR blocks put on a longer cooldown")
 	flag.StringVar(&c.slowKeys, "slow-keys", envOr("SSHPLACE_SLOW_KEYS", ""), "comma separated SSH key fingerprints put on a longer cooldown instead of being blocked")
 	flag.Float64Var(&c.slowFactor, "slow-factor", 4, "multiplier on -cooldown for -slow-keys (1 disables the slowing)")
 	flag.StringVar(&c.logLevel, "log-level", envOr("SSHPLACE_LOG_LEVEL", "info"), "log level: debug, info, warn or error")
@@ -323,6 +328,21 @@ func run(cfg config) error {
 		}
 	}
 
+	blockedNets, badBlockedNets := netset.Parse(cfg.blockedNets)
+	for _, n := range badBlockedNets {
+		logger.Warn("ignoring blocked network, not a CIDR block or address", "value", n)
+	}
+	slowNets, badSlowNets := netset.Parse(cfg.slowNets)
+	for _, n := range badSlowNets {
+		logger.Warn("ignoring slow network, not a CIDR block or address", "value", n)
+	}
+	if blockedNets.Len() > 0 {
+		logger.Info("networks blocked from placing", "nets", blockedNets.String())
+	}
+	if slowNets.Len() > 0 {
+		logger.Info("networks on a longer cooldown", "nets", slowNets.String())
+	}
+
 	logger.Info("canvas ready",
 		"width", cfg.width, "height", cfg.height,
 		"drawn", board.NonEmpty(), "mode", cfg.mode,
@@ -330,19 +350,22 @@ func run(cfg config) error {
 		"max_placements_per_sec", fmt.Sprintf("%.2f", globalRate),
 		"min_board_fill", cfg.minFill, "snapshot", snapshotPath,
 		"admin_keys", len(admins), "blocked_keys", len(blocked),
-		"require_key", cfg.requireKey, "slow_keys", len(slowed), "slow_cooldown", time.Duration(float64(cfg.cooldown)*cfg.slowFactor))
+		"require_key", cfg.requireKey, "slow_keys", len(slowed),
+		"blocked_nets", blockedNets.Len(), "slow_nets", slowNets.Len(), "slow_cooldown", time.Duration(float64(cfg.cooldown)*cfg.slowFactor))
 	a := &app.App{
-		Canvas:     board,
-		Hub:        hub.New(cfg.maxSessions, cfg.maxPerIP),
-		Limiter:    limiter,
-		Log:        events,
-		Logger:     logger,
-		BlocksOnly: blocksOnly,
-		Admins:     admins,
-		Blocked:    blocked,
-		RequireKey: cfg.requireKey,
-		Slowed:     slowed,
-		SlowFactor: cfg.slowFactor,
+		Canvas:      board,
+		Hub:         hub.New(cfg.maxSessions, cfg.maxPerIP),
+		Limiter:     limiter,
+		Log:         events,
+		Logger:      logger,
+		BlocksOnly:  blocksOnly,
+		Admins:      admins,
+		Blocked:     blocked,
+		RequireKey:  cfg.requireKey,
+		Slowed:      slowed,
+		BlockedNets: blockedNets,
+		SlowedNets:  slowNets,
+		SlowFactor:  cfg.slowFactor,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
