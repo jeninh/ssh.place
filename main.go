@@ -43,6 +43,7 @@ type config struct {
 	snapshotFor time.Duration
 	eventLog    bool
 	webURL      string
+	community   string
 	logLevel    string
 	mode        string
 	minFill     time.Duration
@@ -81,6 +82,7 @@ func parseFlags() config {
 	flag.DurationVar(&c.snapshotFor, "snapshot-interval", 10*time.Second, "how often to write the canvas snapshot")
 	flag.BoolVar(&c.eventLog, "event-log", true, "append every placement to events.jsonl")
 	flag.StringVar(&c.webURL, "web-url", envOr("SSHPLACE_WEB_URL", "https://ssh.place"), "URL shown in the in-session help text")
+	flag.StringVar(&c.community, "community", envOr("SSHPLACE_COMMUNITY", "r/sshplace"), "community name shown in the in-session help text (empty to hide)")
 	flag.DurationVar(&c.minFill, "min-board-fill", time.Hour, "floor on how long repainting every cell of the canvas can take, whatever a client controls (0 disables the ceiling)")
 	flag.StringVar(&c.mode, "mode", envOr("SSHPLACE_MODE", "blocks"), `"blocks" for solid color only, or "mixed" to also allow characters`)
 	flag.StringVar(&c.adminKeys, "admin-keys", envOr("SSHPLACE_ADMIN_KEYS", ""), "comma separated SSH key fingerprints exempt from every rate limit, e.g. SHA256:abc...")
@@ -173,6 +175,25 @@ func parseMode(v string) (blocksOnly bool, err error) {
 		return false, nil
 	}
 	return false, fmt.Errorf("-mode must be \"blocks\" or \"mixed\", got %q", v)
+}
+
+// signoff is the line printed as a session ends.
+//
+// It exists because the in-session help bar is width limited and its fullest
+// line already fills an 80 column terminal, so on the commonest size there is
+// nowhere to put a link. This lands on the real terminal after the TUI has gone.
+func signoff(webURL, community string) string {
+	var parts []string
+	if webURL != "" {
+		parts = append(parts, "Timelapses and stats: "+webURL)
+	}
+	if community != "" {
+		parts = append(parts, community)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.Join(parts, " · ")
 }
 
 func envOr(key, fallback string) string {
@@ -333,6 +354,8 @@ func run(cfg config) error {
 		App:         a,
 		IdleTimeout: cfg.idleTimeout,
 		WebURL:      cfg.webURL,
+		Community:   cfg.community,
+		Signoff:     signoff(cfg.webURL, cfg.community),
 		BlocksOnly:  blocksOnly,
 		MaxSessions: cfg.maxSessions,
 		Logger:      logger,

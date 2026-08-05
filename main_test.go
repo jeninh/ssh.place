@@ -243,3 +243,25 @@ func TestParseAdminKeys(t *testing.T) {
 		})
 	}
 }
+
+func TestSignoff(t *testing.T) {
+	tests := []struct {
+		name           string
+		web, community string
+		want           string
+	}{
+		{"both", "https://ssh.place", "r/sshplace", "Timelapses and stats: https://ssh.place · r/sshplace"},
+		{"web only", "https://ssh.place", "", "Timelapses and stats: https://ssh.place"},
+		{"community only", "", "r/sshplace", "r/sshplace"},
+		// Neither configured must produce nothing at all, not a stray separator on
+		// the way out of every session.
+		{"neither", "", "", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := signoff(tt.web, tt.community); got != tt.want {
+				t.Errorf("signoff = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}

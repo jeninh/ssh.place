@@ -47,6 +47,7 @@ type options struct {
 	idleTimeout      time.Duration
 	dataDir          string
 	blocksOnly       bool
+	signoff          string
 }
 
 type fixture struct {
@@ -90,6 +91,7 @@ func start(t *testing.T, mutate ...func(*options)) *fixture {
 		App:         a,
 		IdleTimeout: o.idleTimeout,
 		BlocksOnly:  o.blocksOnly,
+		Signoff:     o.signoff,
 		Logger:      quiet(),
 	})
 	if err != nil {
@@ -768,4 +770,41 @@ func TestFrameIsVisibleOverSSH(t *testing.T) {
 		out := term.output.String()
 		return strings.Contains(out, "+---") && strings.Contains(out, "|")
 	})
+}
+
+// Config.Signoff was set by main and read by nothing for a while. Go does not
+// warn about an unused struct field, and a unit test of the string builder passed
+// happily, so only a real session caught it. This is that check, automated.
+func TestSignoffReachesTheClient(t *testing.T) {
+	const line = "Timelapses and stats: https://ssh.place \u00b7 r/sshplace"
+	f := start(t, func(o *options) { o.signoff = line })
+	term := f.open(t, f.dial(t))
+
+	term.typeKeys(t, "q")
+	waitFor(t, "the signoff", func() bool {
+		return strings.Contains(term.output.String(), "r/sshplace")
+	})
+	out := term.output.String()
+	if !strings.Contains(out, line) {
+		t.Errorf("signoff missing or altered.\ngot:\n%s", out)
+	}
+	// It has to come after the farewell, not instead of it.
+	if !strings.Contains(out, "Thanks for drawing") {
+		t.Errorf("farewell was lost:\ngot:\n%s", out)
+	}
+	if strings.Index(out, "Thanks for drawing") > strings.Index(out, line) {
+		t.Error("signoff printed before the farewell")
+	}
+}
+
+func TestNoSignoffConfiguredPrintsNothingExtra(t *testing.T) {
+	f := start(t)
+	term := f.open(t, f.dial(t))
+	term.typeKeys(t, "q")
+	waitFor(t, "the farewell", func() bool {
+		return strings.Contains(term.output.String(), "Thanks for drawing")
+	})
+	if strings.Contains(term.output.String(), "r/sshplace") {
+		t.Error("printed a signoff that was never configured")
+	}
 }

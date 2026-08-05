@@ -45,6 +45,10 @@ type Config struct {
 	IdleTimeout time.Duration
 	// WebURL is shown in the session help text, when set.
 	WebURL string
+	// Community is shown in the session help text after WebURL.
+	Community string
+	// Signoff is printed after the farewell, once the alternate screen is gone.
+	Signoff string
 	// BlocksOnly hides character mode from sessions. The App enforces it.
 	BlocksOnly bool
 	// MaxSessions is the hub's session cap. The listener uses it to bound how
@@ -193,6 +197,14 @@ func (s *Server) admit(next ssh.Handler) ssh.Handler {
 			msg = "Thanks for drawing on ssh.place. Come back and add another one."
 		}
 		fmt.Fprintf(sess, "%s\r\n", msg)
+		// The help bar cannot always carry these: its widest line is exactly 80
+		// columns, so on the commonest terminal size there is no room left for a
+		// link. Here there is room, this lands on the real terminal rather than
+		// inside the alternate screen, and leaving is the moment someone might
+		// actually go looking for the rest of it.
+		if s.cfg.Signoff != "" {
+			fmt.Fprintf(sess, "%s\r\n", s.cfg.Signoff)
+		}
 	}
 }
 
@@ -211,6 +223,7 @@ func (s *Server) teaHandler(sess ssh.Session) (tea.Model, []tea.ProgramOption) {
 		Renderer:    newRenderer(sess),
 		IdleTimeout: s.cfg.IdleTimeout,
 		WebURL:      s.cfg.WebURL,
+		Community:   s.cfg.Community,
 		BlocksOnly:  s.cfg.BlocksOnly,
 		RequireKey:  s.cfg.App.RequireKey,
 		Exit:        exit,

@@ -59,6 +59,12 @@ ssh ssh.place
 | `home` / `end` | jump to the left or right edge |
 | `q` or `ctrl+c` | quit |
 
+The help line along the bottom shows the site and `r/sshplace` when the terminal is
+wide enough for them. Its fullest line is exactly 80 columns, which is the commonest
+terminal width, so on an 80 column terminal the keybindings win and the links move to
+the message printed as you leave. A binding you cannot discover is worse than a link
+you cannot see.
+
 The canvas is 200 columns wide and your terminal isn't, so the view pans along as
 you get near an edge. Crossing the whole thing one cell at a time is a slog. Scroll
 instead, or hit `shift`+`←`/`→` to jump a screen.

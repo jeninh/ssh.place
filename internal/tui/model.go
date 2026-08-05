@@ -75,6 +75,9 @@ type Config struct {
 	IdleTimeout time.Duration
 	// WebURL, when set, is shown in the help text.
 	WebURL string
+	// Community, when set, is shown in the help text after WebURL. There is
+	// nothing to click in a terminal, so this is just the name to read.
+	Community string
 	// BlocksOnly hides character mode entirely. It must match the App's own
 	// setting, which is what actually enforces it.
 	BlocksOnly bool
@@ -89,14 +92,15 @@ type Config struct {
 
 // Model is one session's view of the canvas.
 type Model struct {
-	app     *app.App
-	sess    *hub.Session
-	exit    *Exit
-	now     func() time.Time
-	idle    time.Duration
-	webURL  string
-	painter *painter
-	styles  styles
+	app       *app.App
+	sess      *hub.Session
+	exit      *Exit
+	now       func() time.Time
+	idle      time.Duration
+	webURL    string
+	community string
+	painter   *painter
+	styles    styles
 
 	canvasW, canvasH int
 	termW, termH     int
@@ -171,22 +175,23 @@ func New(cfg Config) *Model {
 	colorful := cfg.Renderer == nil || cfg.Renderer.ColorProfile() != termenv.Ascii
 
 	m := &Model{
-		app:     cfg.App,
-		sess:    cfg.Session,
-		exit:    cfg.Exit,
-		now:     nowFn,
-		idle:    cfg.IdleTimeout,
-		webURL:  cfg.WebURL,
-		painter: newPainter(colorful),
-		styles:  newStyles(cfg.Renderer),
-		canvasW: w,
-		canvasH: h,
-		termW:   80,
-		termH:   24,
-		curX:    w / 2,
-		curY:    h / 2,
-		stamp:   '#',
-		color:   canvas.DefaultColor,
+		app:       cfg.App,
+		sess:      cfg.Session,
+		exit:      cfg.Exit,
+		now:       nowFn,
+		idle:      cfg.IdleTimeout,
+		webURL:    cfg.WebURL,
+		community: cfg.Community,
+		painter:   newPainter(colorful),
+		styles:    newStyles(cfg.Renderer),
+		canvasW:   w,
+		canvasH:   h,
+		termW:     80,
+		termH:     24,
+		curX:      w / 2,
+		curY:      h / 2,
+		stamp:     '#',
+		color:     canvas.DefaultColor,
 		// Blocks are the default either way; blocks-only just removes the way
 		// out of it.
 		block:      true,
@@ -957,9 +962,17 @@ func (m *Model) helpBar(width int) string {
 	case m.block:
 		ladder = blockHelp
 	}
-	candidates := make([]string, 0, len(ladder)+1)
+	// Widest first: the extras are the first thing to drop, because a binding you
+	// cannot discover is worse than a link you cannot see.
+	candidates := make([]string, 0, len(ladder)+2)
+	if m.webURL != "" && m.community != "" {
+		candidates = append(candidates, ladder[0]+" · "+m.webURL+" · "+m.community)
+	}
 	if m.webURL != "" {
 		candidates = append(candidates, ladder[0]+" · "+m.webURL)
+	}
+	if m.community != "" {
+		candidates = append(candidates, ladder[0]+" · "+m.community)
 	}
 	candidates = append(candidates, ladder...)
 	for _, c := range candidates {
